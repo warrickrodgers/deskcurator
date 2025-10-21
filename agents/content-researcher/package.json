@@ -1,0 +1,32 @@
+{
+  "name": "content-researcher",
+  "type": "module",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "node dist/index.js",
+    "discord": "node dist/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "@types/node": "^24.9.1",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@langchain/classic": "^0.1.25",
+    "@langchain/community": "^0.0.53",
+    "@langchain/core": "^0.1.61",
+    "@langchain/google-genai": "^0.0.30",
+    "discord.js": "^14.23.2",
+    "dotenv": "^16.4.5",
+    "duck-duck-scrape": "^2.2.7",
+    "langchain": "^0.1.36",
+    "typescript": "^5.9.3"
+  }
+}
