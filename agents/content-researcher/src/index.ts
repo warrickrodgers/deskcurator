@@ -17,7 +17,7 @@ interface ResearchResult {
 }
 
 const model = new ChatGoogleGenerativeAI({
-  model: "gemini-1.0-pro",
+  model: "gemini-2.5-pro",
   apiKey: process.env.GOOGLE_API_KEY!,
 });
 

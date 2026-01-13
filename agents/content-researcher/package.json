@@ -22,7 +22,7 @@
     "@langchain/classic": "^0.1.25",
     "@langchain/community": "^0.0.53",
     "@langchain/core": "^0.1.61",
-    "@langchain/google-genai": "^0.0.30",
+    "@langchain/google-genai": "^2.1.12",
     "discord.js": "^14.23.2",
     "dotenv": "^16.4.5",
     "duck-duck-scrape": "^2.2.7",
