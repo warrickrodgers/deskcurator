@@ -1,1 +1,0 @@
-// Amazon affiliate link handler
