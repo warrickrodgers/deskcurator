@@ -11,53 +11,58 @@ import {
   AIStreamChunk,
   AIServiceError,
   TokenUsageTracker,
+  IAIProvider,
+  MessageRole,
+  AIMessage,
 } from '../types/ai.types';
 import { config } from '../config';
 import { GeminiProvider } from './gemini.provider';
 import { AnthropicProvider } from './anthropic.provider';
 import { RateLimiter } from '../utils/rateLimiter';
 import { retryWithBackoff } from '../utils/retry';
+import { logger } from '../utils/logger';
 
 export class AIService {
-  private provider: AIProvider;
+  private provider: IAIProvider;
   private rateLimiter: RateLimiter;
-  private tokenUsage: TokenUsageTracker;
+  private tokenTracker: TokenUsageTracker;
   private readonly maxRetries: number;
   private readonly retryDelay: number;
 
   constructor() {
     // Initialize provider based on config
+    const providerType = config.ai.provider;
     const providerConfig =
-      config.ai.provider === 'anthropic'
+      providerType === 'anthropic'
         ? config.ai.anthropic
         : config.ai.gemini;
 
-    this.provider = this.createProvider(config.ai.provider, providerConfig);
+    this.provider = this.createProvider(providerType, providerConfig);
     this.rateLimiter = new RateLimiter(providerConfig.rateLimitPerMinute);
     this.maxRetries = providerConfig.maxRetries;
     this.retryDelay = providerConfig.retryDelay;
 
     // Initialize token usage tracker
-    this.tokenUsage = {
-      promptTokens: 0,
-      completionTokens: 0,
-      totalTokens: 0,
-      requestCount: 0,
-      lastReset: new Date(),
-    };
+    this.tokenTracker = new TokenUsageTracker();
+
+    logger.info(`AIService initialized with provider: ${providerType}`);
   }
 
   private createProvider(
-    providerName: string,
+    providerType: string,
     providerConfig: any
-  ): AIProvider {
-    switch (providerName) {
+  ): IAIProvider {
+    switch (providerType) {
       case 'anthropic':
         return new AnthropicProvider(providerConfig);
       case 'gemini':
         return new GeminiProvider(providerConfig);
       default:
-        throw new Error(`Unknown provider: ${providerName}`);
+        throw new AIServiceError(
+          `Unknown provider: ${providerType}`,
+          'INVALID_REQUEST' as any,
+          AIProvider.GEMINI // Default fallback
+        );
     }
   }
 
@@ -67,22 +72,34 @@ export class AIService {
   async complete(
     request: AICompletionRequest
   ): Promise<AICompletionResponse> {
-    // Apply rate limiting
-    await this.rateLimiter.acquire();
+    try {
+      // Apply rate limiting
+      await this.rateLimiter.acquire();
 
-    // Execute with retry logic
-    const response = await retryWithBackoff(
-      () => this.provider.complete(request),
-      {
-        maxRetries: this.maxRetries,
-        baseDelay: this.retryDelay,
+      // Execute with retry logic
+      const response = await retryWithBackoff(
+        () => this.provider.generateCompletion(request),
+        {
+          maxRetries: this.maxRetries,
+          baseDelay: this.retryDelay,
+        }
+      );
+
+      // Track token usage
+      if (response.usage) {
+        this.tokenTracker.track(this.provider.provider, response.usage);
       }
-    );
 
-    // Track token usage
-    this.updateTokenUsage(response.usage);
+      logger.debug('Completion successful', {
+        provider: response.provider,
+        tokens: response.usage?.totalTokens,
+      });
 
-    return response;
+      return response;
+    } catch (error) {
+      logger.error('Completion failed', { error });
+      throw error;
+    }
   }
 
   /**
@@ -91,24 +108,39 @@ export class AIService {
   async streamComplete(
     request: AICompletionRequest,
     onChunk: (chunk: AIStreamChunk) => void
-  ): Promise<void> {
-    // Apply rate limiting
-    await this.rateLimiter.acquire();
+  ): Promise<AICompletionResponse> {
+    try {
+      // Apply rate limiting
+      await this.rateLimiter.acquire();
 
-    // Execute with retry logic
-    await retryWithBackoff(
-      () => this.provider.streamComplete(request, (chunk) => {
-        // Track usage from final chunk
-        if (chunk.isComplete && chunk.usage) {
-          this.updateTokenUsage(chunk.usage);
+      // Ensure stream flag is set
+      const streamRequest = { ...request, stream: true };
+
+      // Execute with retry logic
+      const response = await retryWithBackoff(
+        () => this.provider.generateStreamingCompletion(streamRequest, (chunk) => {
+          // Track usage from final chunk
+          if (chunk.isComplete && chunk.usage) {
+            this.tokenTracker.track(this.provider.provider, chunk.usage);
+          }
+          onChunk(chunk);
+        }),
+        {
+          maxRetries: this.maxRetries,
+          baseDelay: this.retryDelay,
         }
-        onChunk(chunk);
-      }),
-      {
-        maxRetries: this.maxRetries,
-        baseDelay: this.retryDelay,
-      }
-    );
+      );
+
+      logger.debug('Streaming completion successful', {
+        provider: response.provider,
+        tokens: response.usage?.totalTokens,
+      });
+
+      return response;
+    } catch (error) {
+      logger.error('Streaming completion failed', { error });
+      throw error;
+    }
   }
 
   /**
@@ -123,24 +155,36 @@ export class AIService {
       stream?: boolean;
     }
   ): Promise<string> {
-    const messages = [];
+    const messages: AIMessage[] = [];
 
     if (systemPrompt) {
-      messages.push({ role: 'system' as const, content: systemPrompt });
+      messages.push({ 
+        role: MessageRole.SYSTEM, 
+        content: systemPrompt 
+      });
     }
 
-    messages.push({ role: 'user' as const, content: prompt });
+    messages.push({ 
+      role: MessageRole.USER, 
+      content: prompt 
+    });
+
+    const request: AICompletionRequest = {
+      messages,
+      config: {
+        provider: this.provider.provider,
+        model: this.provider.modelConfig.model,
+        maxTokens: options?.maxTokens,
+        temperature: options?.temperature,
+      },
+      stream: options?.stream || false,
+    };
 
     if (options?.stream) {
       let fullResponse = '';
       
       await this.streamComplete(
-        {
-          messages,
-          maxTokens: options.maxTokens || config.defaults.maxTokens,
-          temperature: options.temperature || config.defaults.temperature,
-          stream: true,
-        },
+        request,
         (chunk) => {
           if (!chunk.isComplete) {
             fullResponse += chunk.content;
@@ -150,12 +194,7 @@ export class AIService {
 
       return fullResponse;
     } else {
-      const response = await this.complete({
-        messages,
-        maxTokens: options?.maxTokens || config.defaults.maxTokens,
-        temperature: options?.temperature || config.defaults.temperature,
-      });
-
+      const response = await this.complete(request);
       return response.content;
     }
   }
@@ -164,20 +203,36 @@ export class AIService {
    * Get current token usage statistics
    */
   getTokenUsage(): TokenUsageTracker {
-    return { ...this.tokenUsage };
+    return this.tokenTracker;
+  }
+
+  /**
+   * Get usage for specific provider
+   */
+  getProviderUsage(provider: AIProvider) {
+    return this.tokenTracker.getUsage(provider);
+  }
+
+  /**
+   * Get total usage across all providers
+   */
+  getTotalUsage() {
+    return this.tokenTracker.getTotalUsage();
+  }
+
+  /**
+   * Get usage summary
+   */
+  getUsageSummary() {
+    return this.tokenTracker.getSummary();
   }
 
   /**
    * Reset token usage statistics
    */
   resetTokenUsage(): void {
-    this.tokenUsage = {
-      promptTokens: 0,
-      completionTokens: 0,
-      totalTokens: 0,
-      requestCount: 0,
-      lastReset: new Date(),
-    };
+    this.tokenTracker.reset();
+    logger.info('Token usage statistics reset');
   }
 
   /**
@@ -190,29 +245,30 @@ export class AIService {
   /**
    * Get provider information
    */
-  getProviderInfo(): { name: string; model: string } {
-    const providerConfig =
-      config.ai.provider === 'anthropic'
-        ? config.ai.anthropic
-        : config.ai.gemini;
-
+  getProviderInfo(): { 
+    name: string; 
+    provider: AIProvider;
+    model: string;
+  } {
     return {
-      name: this.provider.name,
-      model: providerConfig.model,
+      name: this.provider.provider,
+      provider: this.provider.provider,
+      model: this.provider.modelConfig.model,
     };
   }
 
-  private updateTokenUsage(usage?: {
-    promptTokens: number;
-    completionTokens: number;
-    totalTokens: number;
-  }): void {
-    if (usage) {
-      this.tokenUsage.promptTokens += usage.promptTokens;
-      this.tokenUsage.completionTokens += usage.completionTokens;
-      this.tokenUsage.totalTokens += usage.totalTokens;
-    }
-    this.tokenUsage.requestCount += 1;
+  /**
+   * Estimate token count for messages
+   */
+  estimateTokenCount(messages: AIMessage[]): number {
+    return this.provider.estimateTokenCount(messages);
+  }
+
+  /**
+   * Check rate limit status
+   */
+  async checkRateLimit() {
+    return this.provider.checkRateLimit();
   }
 }
 
