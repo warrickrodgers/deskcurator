@@ -1,230 +1,285 @@
-import logger from '../utils/logger';
-import discordService from '../services/discord';
-import { ResearchFindings, Product, ApprovalRequest } from '../types';
 import { randomUUID } from 'crypto';
+import logger from '../../utils/logger';
+import discordService from '../../services/discord';
+import { aiService } from '../../services/ai.service';
+import { searchService, SearchResult } from '../../services/search.service';
+import { chromaService } from '../../services/chroma.service';
+import { databaseService } from '../../services/database.service';
+import { SYSTEM_PROMPT, analyzeProsConsPrompt, competitorPrompt, summaryPrompt } from './context';
+import { ResearchFindings, Product, ApprovalRequest, Source } from '../../types';
+import config from '../../config/env';
+
+const HIGH_CREDIBILITY_DOMAINS = [
+  'amazon.com',
+  'rtings.com',
+  'wirecutter.com',
+  'techradar.com',
+  'pcmag.com',
+  'tomsguide.com',
+  'reddit.com',
+  'desksetup.io',
+  'thewirecutter.com',
+];
 
 export class ContentResearcher {
-  private isRunning: boolean = false;
+  private isRunning = false;
 
   constructor() {
-    logger.info('📚 ContentResearcher agent initialized');
+    logger.info('ContentResearcher agent initialized');
   }
 
-  /**
-   * Start the research agent
-   */
   async start(): Promise<void> {
     this.isRunning = true;
-    logger.info('🚀 ContentResearcher agent started');
-    
-    // TODO: Implement main agent loop
-    // This could listen for commands, scheduled tasks, or work from a queue
+    logger.info('ContentResearcher agent started');
   }
 
-  /**
-   * Stop the research agent
-   */
   async stop(): Promise<void> {
     this.isRunning = false;
-    logger.info('🛑 ContentResearcher agent stopped');
+    logger.info('ContentResearcher agent stopped');
   }
 
-  /**
-   * Research a specific product
-   */
   async researchProduct(productQuery: string): Promise<ResearchFindings | null> {
-    try {
-      logger.info(`🔍 Starting research for: ${productQuery}`);
+    const jobId = randomUUID();
+    logger.info(`Research job ${jobId} started for: "${productQuery}"`);
 
-      // Step 1: Search for product information
-      const product = await this.findProduct(productQuery);
-      if (!product) {
-        logger.warn(`Product not found: ${productQuery}`);
+    try {
+      // 1. Build initial product record from the query
+      const product = this.buildProduct(productQuery);
+
+      // 2. ChromaDB dedup check — skip if very similar research already exists
+      const isDuplicate = await chromaService.hasSimilarResearch(
+        product.name,
+        product.category,
+        productQuery
+      );
+      if (isDuplicate) {
+        logger.info(`Skipping "${productQuery}" — similar research already stored`);
         return null;
       }
 
-      // Step 2: Gather specifications
-      logger.info('📊 Gathering product specifications...');
-      const specifications = await this.gatherSpecifications(product);
+      // 3. Persist initial records to SQLite
+      databaseService.insertProduct({
+        id: product.id,
+        name: product.name,
+        category: product.category,
+        price: product.price,
+        url: product.url,
+        affiliateLink: product.affiliateLink,
+      });
+      databaseService.insertResearchJob({
+        id: jobId,
+        productId: product.id,
+        status: 'running',
+        searchQuery: productQuery,
+      });
 
-      // Step 3: Analyze pros and cons
-      logger.info('⚖️ Analyzing pros and cons...');
-      const { pros, cons } = await this.analyzeProsAndCons(product, specifications);
+      // 4. Run three Tavily searches in parallel
+      logger.info('Running web searches (info, reviews, competitors)...');
+      const [infoResults, reviewResults, competitorResults] = await Promise.all([
+        searchService.searchProductInfo(productQuery),
+        searchService.searchProductReviews(productQuery),
+        searchService.searchCompetitors(productQuery, product.category),
+      ]);
 
-      // Step 4: Research competitors
-      logger.info('🏆 Analyzing competitors...');
-      const competitorAnalysis = await this.analyzeCompetitors(product);
+      logger.info(
+        `Search complete: ${infoResults.length} info, ${reviewResults.length} review, ${competitorResults.length} competitor results`
+      );
 
-      // Step 5: Compile findings
+      // Build source list from info + review results
+      const sources: Source[] = [
+        ...infoResults.map((r) => this.toSource(r)),
+        ...reviewResults.map((r) => this.toSource(r)),
+      ];
+
+      // Combine content for AI analysis
+      const infoContent = infoResults.map((r) => `[${r.title}]\n${r.content}`).join('\n\n');
+      const reviewContent = reviewResults.map((r) => `[${r.title}]\n${r.content}`).join('\n\n');
+      const combinedContent = `PRODUCT INFO:\n${infoContent}\n\nREVIEWS:\n${reviewContent}`;
+      const competitorContent = competitorResults
+        .map((r) => `[${r.title}]\n${r.content}`)
+        .join('\n\n');
+
+      // 5. Gemini: extract pros/cons
+      logger.info('Analyzing pros and cons with Gemini...');
+      const prosConsRaw = await aiService.ask(
+        analyzeProsConsPrompt(product.name, combinedContent),
+        SYSTEM_PROMPT
+      );
+      const { pros, cons } = this.parseProsConsResponse(prosConsRaw, product.name);
+
+      // 6. Gemini: competitor analysis
+      logger.info('Analyzing competitors with Gemini...');
+      const competitorRaw = await aiService.ask(
+        competitorPrompt(product.name, product.category, competitorContent),
+        SYSTEM_PROMPT
+      );
+      const competitorAnalysis = this.parseCompetitorResponse(competitorRaw);
+
+      // 7. Gemini: generate affiliate summary
+      logger.info('Generating affiliate summary with Gemini...');
+      const summary = await aiService.ask(
+        summaryPrompt(
+          product.name,
+          product.category,
+          pros,
+          cons,
+          competitorAnalysis,
+          config.amazon.affiliateTag
+        ),
+        SYSTEM_PROMPT
+      );
+
+      // 8. Calculate confidence score
+      const confidence = this.calculateConfidence(sources, pros, cons, infoResults);
+
       const findings: ResearchFindings = {
         product,
-        specifications,
+        specifications: this.extractSpecifications(infoResults),
         pros,
         cons,
         competitorAnalysis,
-        sources: [], // TODO: Track sources during research
-        summary: await this.generateSummary(product, pros, cons),
-        confidence: this.calculateConfidence(specifications, pros, cons),
+        sources,
+        summary,
+        confidence,
       };
 
-      // Step 6: Request human approval
-      logger.info('📤 Requesting approval from admin...');
-      const approved = await this.requestApproval(findings);
+      logger.info(`Research complete — confidence: ${(confidence * 100).toFixed(0)}%`);
+
+      // 9. Store in ChromaDB
+      await chromaService.storeResearch(jobId, findings, productQuery);
+
+      // 10. Update SQLite job as completed
+      databaseService.updateResearchJobStatus(jobId, 'completed', confidence);
+
+      // 11. Request Discord approval
+      logger.info('Requesting Discord approval...');
+      const approvalId = randomUUID();
+      databaseService.insertApprovalRecord({
+        id: approvalId,
+        researchJobId: jobId,
+        status: 'pending',
+      });
+
+      const { approved, feedback } = await this.requestApproval(findings, approvalId);
 
       if (approved) {
-        logger.info('✅ Research approved!');
+        databaseService.updateApprovalStatus(approvalId, 'approved');
+        logger.info(`Research approved for: ${product.name}`);
         return findings;
       } else {
-        logger.info('❌ Research rejected');
+        databaseService.updateApprovalStatus(approvalId, 'rejected', feedback);
+        logger.info(
+          `Research rejected for: ${product.name}${feedback ? ` — feedback: ${feedback}` : ''}`
+        );
         return null;
       }
     } catch (error) {
-      logger.error('Failed to research product:', error);
+      logger.error(`Research job ${jobId} failed:`, error);
+      databaseService.updateResearchJobStatus(jobId, 'failed');
       throw error;
     }
   }
 
-  /**
-   * Find product information
-   * TODO: Implement actual product search (Amazon API, web scraping, etc.)
-   */
-  private async findProduct(query: string): Promise<Product | null> {
-    // Mock implementation - replace with actual product search
-    logger.debug(`Searching for product: ${query}`);
-    
-    // TODO: Implement real product search
-    // - Amazon Product Advertising API
-    // - Web scraping
-    // - Product databases
-    
+  // ── Private helpers ─────────────────────────────────────────────────────────
+
+  private buildProduct(query: string): Product {
     return {
       id: randomUUID(),
       name: query,
       category: 'Desk Equipment',
-      url: 'https://amazon.com/placeholder',
+      url: `https://www.amazon.com/s?k=${encodeURIComponent(query)}&tag=${config.amazon.affiliateTag ?? ''}`,
     };
   }
 
-  /**
-   * Gather detailed product specifications
-   * TODO: Implement specification extraction
-   */
-  private async gatherSpecifications(product: Product): Promise<Record<string, any>> {
-    // Mock implementation
-    logger.debug(`Gathering specs for: ${product.name}`);
-    
-    // TODO: Implement real specification gathering
-    // - Parse product pages
-    // - Extract technical details
-    // - Verify information across sources
-    
+  private toSource(result: SearchResult): Source {
+    let hostname = '';
+    try {
+      hostname = new URL(result.url).hostname.replace('www.', '');
+    } catch {
+      hostname = result.url;
+    }
     return {
-      dimensions: 'TBD',
-      weight: 'TBD',
-      material: 'TBD',
-      warranty: 'TBD',
+      url: result.url,
+      title: result.title,
+      credibility: HIGH_CREDIBILITY_DOMAINS.some((d) => hostname.includes(d))
+        ? 'high'
+        : result.score > 0.7
+        ? 'medium'
+        : 'low',
+      dateAccessed: new Date(),
     };
   }
 
-  /**
-   * Analyze pros and cons using AI
-   * TODO: Implement AI-powered analysis
-   */
-  private async analyzeProsAndCons(
-    product: Product,
-    specs: Record<string, any>
-  ): Promise<{ pros: string[]; cons: string[] }> {
-    // Mock implementation
-    logger.debug(`Analyzing pros/cons for: ${product.name}`);
-    
-    // TODO: Implement AI analysis
-    // - Use Claude/GPT to analyze product
-    // - Cross-reference with reviews
-    // - Identify unique selling points
-    // - Find potential drawbacks
-    
+  private parseProsConsResponse(
+    raw: string,
+    productName: string
+  ): { pros: string[]; cons: string[] } {
+    try {
+      const cleaned = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      const parsed = JSON.parse(cleaned);
+      if (Array.isArray(parsed.pros) && Array.isArray(parsed.cons)) {
+        return { pros: parsed.pros, cons: parsed.cons };
+      }
+      throw new Error('Unexpected JSON shape');
+    } catch {
+      logger.warn(`Could not parse pros/cons JSON for "${productName}" — using fallback`);
+      return {
+        pros: ['Research completed — manual review required'],
+        cons: ['Structured analysis parsing failed'],
+      };
+    }
+  }
+
+  private parseCompetitorResponse(raw: string): string[] {
+    try {
+      const cleaned = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      const parsed = JSON.parse(cleaned);
+      if (Array.isArray(parsed.competitors)) {
+        return parsed.competitors;
+      }
+      throw new Error('Unexpected JSON shape');
+    } catch {
+      logger.warn('Could not parse competitor JSON — using fallback');
+      return ['Competitor analysis parsing failed — manual review required'];
+    }
+  }
+
+  private extractSpecifications(infoResults: SearchResult[]): Record<string, string> {
     return {
-      pros: [
-        'Example pro 1',
-        'Example pro 2',
-        'Example pro 3',
-      ],
-      cons: [
-        'Example con 1',
-        'Example con 2',
-      ],
+      sourcesReviewed: String(infoResults.length),
+      primarySource: infoResults[0]?.title ?? 'N/A',
+      primarySourceUrl: infoResults[0]?.url ?? 'N/A',
     };
   }
 
-  /**
-   * Analyze competitor products
-   * TODO: Implement competitor analysis
-   */
-  private async analyzeCompetitors(product: Product): Promise<string[]> {
-    // Mock implementation
-    logger.debug(`Analyzing competitors for: ${product.name}`);
-    
-    // TODO: Implement competitor research
-    // - Find similar products
-    // - Compare features and pricing
-    // - Identify market positioning
-    
-    return [
-      'Competitor A: Similar features, higher price',
-      'Competitor B: Lower quality, budget option',
-    ];
-  }
-
-  /**
-   * Generate research summary
-   * TODO: Implement AI-powered summary generation
-   */
-  private async generateSummary(
-    product: Product,
-    pros: string[],
-    cons: string[]
-  ): Promise<string> {
-    // Mock implementation
-    logger.debug(`Generating summary for: ${product.name}`);
-    
-    // TODO: Implement AI summary generation
-    // - Synthesize research findings
-    // - Create compelling narrative
-    // - Maintain credibility and balance
-    
-    return `Research completed for ${product.name}. Found ${pros.length} advantages and ${cons.length} considerations. Analysis pending review.`;
-  }
-
-  /**
-   * Calculate confidence score based on research quality
-   */
   private calculateConfidence(
-    specs: Record<string, any>,
+    sources: Source[],
     pros: string[],
-    cons: string[]
+    cons: string[],
+    infoResults: SearchResult[]
   ): number {
-    // Simple confidence calculation
-    let score = 0.5; // Base score
-    
-    // Increase confidence with more data
-    if (Object.keys(specs).length > 3) score += 0.1;
-    if (pros.length > 2) score += 0.1;
-    if (cons.length > 1) score += 0.1;
-    
-    // TODO: Implement more sophisticated confidence scoring
-    // - Source credibility weights
-    // - Data completeness
-    // - Cross-reference verification
-    
-    return Math.min(score, 1.0);
+    let score = 0.3;
+
+    const highCred = sources.filter((s) => s.credibility === 'high').length;
+    score += Math.min(highCred * 0.1, 0.3);
+
+    if (pros.length >= 4) score += 0.1;
+    if (cons.length >= 3) score += 0.1;
+    if (sources.length >= 8) score += 0.05;
+
+    const avgScore =
+      infoResults.reduce((sum, r) => sum + r.score, 0) / (infoResults.length || 1);
+    if (avgScore > 0.7) score += 0.05;
+
+    return Math.min(parseFloat(score.toFixed(2)), 1.0);
   }
 
-  /**
-   * Request approval from admin via Discord
-   */
-  private async requestApproval(findings: ResearchFindings): Promise<boolean> {
-    const approvalRequest: ApprovalRequest = {
-      id: randomUUID(),
+  private async requestApproval(
+    findings: ResearchFindings,
+    approvalId: string
+  ): Promise<{ approved: boolean; feedback?: string }> {
+    const request: ApprovalRequest = {
+      id: approvalId,
       type: 'research',
       data: findings,
       status: 'pending',
@@ -232,21 +287,11 @@ export class ContentResearcher {
     };
 
     try {
-      const result = await discordService.requestApproval(approvalRequest);
-      
-      if (result.approved) {
-        logger.info('✅ Research approved by admin');
-        return true;
-      } else {
-        if (result.feedback) {
-          logger.info(`📝 Feedback received: ${result.feedback}`);
-          // TODO: Implement feedback handling and re-research
-        }
-        return false;
-      }
+      const result = await discordService.requestApproval(request);
+      return { approved: result.approved, feedback: result.feedback };
     } catch (error) {
-      logger.error('Failed to get approval:', error);
-      return false;
+      logger.error('Discord approval request failed:', error);
+      return { approved: false };
     }
   }
 }

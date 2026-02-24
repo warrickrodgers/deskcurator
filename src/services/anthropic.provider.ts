@@ -1,71 +1,63 @@
 /**
  * Anthropic AI Provider
- * Implementation for Claude API (to be completed when API key is available)
+ * Stub implementation — not yet wired up. Gemini is the active provider.
  */
 
 import {
   AIProvider,
   AICompletionRequest,
   AICompletionResponse,
-  AIStreamChunk,
-  AIServiceConfig,
+  AIModelConfig,
+  AIMessage,
   AIServiceError,
+  AIErrorType,
+  RateLimitStatus,
+  StreamCallback,
+  IAIProvider,
 } from '../types/ai.types';
 
-export class AnthropicProvider implements AIProvider {
-  public readonly name = 'anthropic';
-  private config: AIServiceConfig;
+export class AnthropicProvider implements IAIProvider {
+  public readonly provider = AIProvider.ANTHROPIC;
+  public readonly modelConfig: AIModelConfig;
 
-  constructor(config: AIServiceConfig) {
-    this.config = config;
-    // TODO: Initialize Anthropic SDK when available
-    // this.client = new Anthropic({ apiKey: config.apiKey });
+  constructor(config: { apiKey: string; model?: string }) {
+    this.modelConfig = {
+      provider: AIProvider.ANTHROPIC,
+      model: config.model || 'claude-sonnet-4-20250514',
+    };
   }
 
-  async complete(request: AICompletionRequest): Promise<AICompletionResponse> {
-    // TODO: Implement Anthropic API call
-    // Example structure:
-    // const response = await this.client.messages.create({
-    //   model: this.config.model || 'claude-sonnet-4-20250514',
-    //   max_tokens: request.maxTokens || 4096,
-    //   temperature: request.temperature || 0.7,
-    //   messages: request.messages,
-    // });
-
+  async generateCompletion(_request: AICompletionRequest): Promise<AICompletionResponse> {
     throw new AIServiceError(
       'Anthropic provider not yet implemented',
-      'NOT_IMPLEMENTED',
-      501,
-      false
+      AIErrorType.INVALID_REQUEST,
+      AIProvider.ANTHROPIC,
+      501
     );
   }
 
-  async streamComplete(
-    request: AICompletionRequest,
-    onChunk: (chunk: AIStreamChunk) => void
-  ): Promise<void> {
-    // TODO: Implement streaming for Anthropic
-    // const stream = await this.client.messages.stream({
-    //   model: this.config.model || 'claude-sonnet-4-20250514',
-    //   max_tokens: request.maxTokens || 4096,
-    //   temperature: request.temperature || 0.7,
-    //   messages: request.messages,
-    // });
-    //
-    // for await (const chunk of stream) {
-    //   if (chunk.type === 'content_block_delta') {
-    //     onChunk({
-    //       content: chunk.delta.text,
-    //       isComplete: false,
-    //     });
-    //   }
-    // }
-
+  async generateStreamingCompletion(
+    _request: AICompletionRequest,
+    _callback: StreamCallback
+  ): Promise<AICompletionResponse> {
     throw new AIServiceError(
       'Anthropic provider not yet implemented',
-      'NOT_IMPLEMENTED',
-      501,
-      false
+      AIErrorType.INVALID_REQUEST,
+      AIProvider.ANTHROPIC,
+      501
     );
+  }
+
+  async checkRateLimit(): Promise<RateLimitStatus> {
+    return {
+      requestsRemaining: 0,
+      resetTime: new Date(),
+      isLimited: true,
+    };
+  }
+
+  estimateTokenCount(messages: AIMessage[]): number {
+    const text = messages.map((m) => m.content).join(' ');
+    return Math.ceil(text.length / 4);
   }
 }

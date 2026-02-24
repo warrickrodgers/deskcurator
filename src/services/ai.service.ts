@@ -6,6 +6,7 @@
 
 import {
   AIProvider,
+  AIErrorType,
   AICompletionRequest,
   AICompletionResponse,
   AIStreamChunk,
@@ -20,7 +21,7 @@ import { GeminiProvider } from './gemini.provider';
 import { AnthropicProvider } from './anthropic.provider';
 import { RateLimiter } from '../utils/rateLimiter';
 import { retryWithBackoff } from '../utils/retry';
-import { logger } from '../utils/logger';
+import logger from '../utils/logger';
 
 export class AIService {
   private provider: IAIProvider;
@@ -60,8 +61,8 @@ export class AIService {
       default:
         throw new AIServiceError(
           `Unknown provider: ${providerType}`,
-          'INVALID_REQUEST' as any,
-          AIProvider.GEMINI // Default fallback
+          AIErrorType.INVALID_REQUEST,
+          AIProvider.GEMINI
         );
     }
   }

@@ -22,13 +22,18 @@
   "license": "ISC",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.27.3",
+    "@google/generative-ai": "^0.24.1",
+    "@tavily/core": "^0.7.1",
     "axios": "^1.6.5",
+    "better-sqlite3": "^12.6.2",
+    "chromadb": "^3.3.1",
     "discord.js": "^14.14.1",
     "dotenv": "^16.3.1",
     "winston": "^3.11.0",
     "zod": "^3.22.4"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/jest": "^30.0.0",
     "@types/node": "^20.11.5",
     "@typescript-eslint/eslint-plugin": "^6.19.0",

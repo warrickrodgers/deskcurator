@@ -8,42 +8,45 @@ import {
   AIProvider,
   AICompletionRequest,
   AICompletionResponse,
-  AIStreamChunk,
-  AIServiceConfig,
+  AIModelConfig,
+  AIMessage,
   AIServiceError,
+  AIErrorType,
+  RateLimitStatus,
+  StreamCallback,
+  IAIProvider,
 } from '../types/ai.types';
 
-export class GeminiProvider implements AIProvider {
-  public readonly name = 'gemini';
+export class GeminiProvider implements IAIProvider {
+  public readonly provider = AIProvider.GEMINI;
+  public readonly modelConfig: AIModelConfig;
   private client: GoogleGenerativeAI;
   private model: GenerativeModel;
-  private config: AIServiceConfig;
 
-  constructor(config: AIServiceConfig) {
-    this.config = config;
+  constructor(config: { apiKey: string; model?: string }) {
     this.client = new GoogleGenerativeAI(config.apiKey);
-    this.model = this.client.getGenerativeModel({
+    this.modelConfig = {
+      provider: AIProvider.GEMINI,
       model: config.model || 'gemini-2.0-flash-exp',
-    });
+    };
+    this.model = this.client.getGenerativeModel({ model: this.modelConfig.model });
   }
 
-  async complete(request: AICompletionRequest): Promise<AICompletionResponse> {
+  async generateCompletion(request: AICompletionRequest): Promise<AICompletionResponse> {
     try {
-      // Convert messages to Gemini format
       const prompt = this.formatMessages(request.messages);
 
       const result = await this.model.generateContent({
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         generationConfig: {
-          maxOutputTokens: request.maxTokens,
-          temperature: request.temperature,
+          maxOutputTokens: request.config?.maxTokens,
+          temperature: request.config?.temperature,
         },
       });
 
       const response = result.response;
       const text = response.text();
 
-      // Extract usage information if available
       const usage = response.usageMetadata
         ? {
             promptTokens: response.usageMetadata.promptTokenCount || 0,
@@ -54,43 +57,40 @@ export class GeminiProvider implements AIProvider {
 
       return {
         content: text,
+        provider: AIProvider.GEMINI,
+        model: this.modelConfig.model,
         usage,
-        model: this.config.model,
-        finishReason: this.mapFinishReason(response.candidates?.[0]?.finishReason),
+        finishReason: this.mapFinishReason(response.candidates?.[0]?.finishReason?.toString()),
+        timestamp: new Date(),
       };
     } catch (error: any) {
       throw this.handleError(error);
     }
   }
 
-  async streamComplete(
+  async generateStreamingCompletion(
     request: AICompletionRequest,
-    onChunk: (chunk: AIStreamChunk) => void
-  ): Promise<void> {
+    callback: StreamCallback
+  ): Promise<AICompletionResponse> {
     try {
       const prompt = this.formatMessages(request.messages);
 
       const result = await this.model.generateContentStream({
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         generationConfig: {
-          maxOutputTokens: request.maxTokens,
-          temperature: request.temperature,
+          maxOutputTokens: request.config?.maxTokens,
+          temperature: request.config?.temperature,
         },
       });
 
-      let accumulatedText = '';
+      let fullText = '';
 
       for await (const chunk of result.stream) {
         const chunkText = chunk.text();
-        accumulatedText += chunkText;
-
-        onChunk({
-          content: chunkText,
-          isComplete: false,
-        });
+        fullText += chunkText;
+        callback({ content: chunkText, isComplete: false });
       }
 
-      // Send final chunk with usage info
       const response = await result.response;
       const usage = response.usageMetadata
         ? {
@@ -100,19 +100,35 @@ export class GeminiProvider implements AIProvider {
           }
         : undefined;
 
-      onChunk({
-        content: '',
-        isComplete: true,
+      callback({ content: '', isComplete: true, usage });
+
+      return {
+        content: fullText,
+        provider: AIProvider.GEMINI,
+        model: this.modelConfig.model,
         usage,
-      });
+        finishReason: this.mapFinishReason(response.candidates?.[0]?.finishReason?.toString()),
+        timestamp: new Date(),
+      };
     } catch (error: any) {
       throw this.handleError(error);
     }
   }
 
-  private formatMessages(messages: AICompletionRequest['messages']): string {
-    // Gemini's generateContent API is simpler - we'll format messages as a prompt
-    // System messages become part of the instruction, user/assistant alternate
+  async checkRateLimit(): Promise<RateLimitStatus> {
+    return {
+      requestsRemaining: 60,
+      resetTime: new Date(Date.now() + 60000),
+      isLimited: false,
+    };
+  }
+
+  estimateTokenCount(messages: AIMessage[]): number {
+    const text = messages.map((m) => m.content).join(' ');
+    return Math.ceil(text.length / 4);
+  }
+
+  private formatMessages(messages: AIMessage[]): string {
     return messages
       .map((msg) => {
         switch (msg.role) {
@@ -129,71 +145,57 @@ export class GeminiProvider implements AIProvider {
       .join('\n\n');
   }
 
-  private mapFinishReason(reason?: string): string {
+  private mapFinishReason(
+    reason?: string
+  ): 'stop' | 'length' | 'content_filter' | 'error' | undefined {
     switch (reason) {
       case 'STOP':
         return 'stop';
       case 'MAX_TOKENS':
         return 'length';
       case 'SAFETY':
-        return 'content_filter';
       case 'RECITATION':
         return 'content_filter';
       default:
-        return 'unknown';
+        return undefined;
     }
   }
 
   private handleError(error: any): AIServiceError {
-    // Handle Gemini-specific errors
     const message = error.message || 'Unknown error occurred';
-    
-    // Rate limit errors
+
     if (message.includes('quota') || message.includes('rate limit')) {
       return new AIServiceError(
         'Rate limit exceeded',
-        'RATE_LIMIT_EXCEEDED',
-        429,
-        true
+        AIErrorType.RATE_LIMIT,
+        AIProvider.GEMINI,
+        429
       );
     }
-
-    // Invalid API key
     if (message.includes('API key') || message.includes('authentication')) {
       return new AIServiceError(
         'Invalid API key',
-        'INVALID_API_KEY',
-        401,
-        false
+        AIErrorType.AUTHENTICATION,
+        AIProvider.GEMINI,
+        401
       );
     }
-
-    // Content filter
     if (message.includes('safety') || message.includes('blocked')) {
       return new AIServiceError(
         'Content blocked by safety filters',
-        'CONTENT_FILTERED',
-        400,
-        false
+        AIErrorType.CONTENT_FILTER,
+        AIProvider.GEMINI,
+        400
       );
     }
-
-    // Network errors
     if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
       return new AIServiceError(
         'Network error - unable to reach Gemini API',
-        'NETWORK_ERROR',
-        undefined,
-        true
+        AIErrorType.NETWORK_ERROR,
+        AIProvider.GEMINI
       );
     }
 
-    // Default error
-    return new AIServiceError(
-      message,
-      'UNKNOWN_ERROR',
-      error.statusCode,
-      false
-    );
+    return new AIServiceError(message, AIErrorType.UNKNOWN, AIProvider.GEMINI, error.statusCode);
   }
 }

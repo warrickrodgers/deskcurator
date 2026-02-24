@@ -3,7 +3,7 @@
  * Implements exponential backoff for failed requests
  */
 
-import { AIServiceError } from '../types/ai.types';
+import { AIServiceError, AIErrorType } from '../types/ai.types';
 
 export interface RetryConfig {
   maxRetries: number;
@@ -22,7 +22,7 @@ export async function retryWithBackoff<T>(
     maxDelay = 30000,
     shouldRetry = (error) => {
       if (error instanceof AIServiceError) {
-        return error.retryable;
+        return error.type === AIErrorType.RATE_LIMIT || error.type === AIErrorType.NETWORK_ERROR;
       }
       return false;
     },
