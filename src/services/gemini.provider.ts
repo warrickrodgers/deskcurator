@@ -27,7 +27,7 @@ export class GeminiProvider implements IAIProvider {
     this.client = new GoogleGenerativeAI(config.apiKey);
     this.modelConfig = {
       provider: AIProvider.GEMINI,
-      model: config.model || 'gemini-2.5-flash',
+      model: config.model || 'gemini-2.5-flash-lite',
     };
     this.model = this.client.getGenerativeModel({ model: this.modelConfig.model });
   }
@@ -161,6 +161,23 @@ export class GeminiProvider implements IAIProvider {
     }
   }
 
+  /**
+   * Parse the Gemini API-recommended retry delay from a 429 error message.
+   * Looks for "Please retry in 25.83s" or a JSON "retryDelay":"25s" field.
+   * Returns milliseconds, or undefined if not found.
+   */
+  private parseRetryAfterMs(message: string): number | undefined {
+    const textMatch = message.match(/[Pp]lease retry in (\d+\.?\d*)s/);
+    if (textMatch) {
+      return Math.ceil(parseFloat(textMatch[1]) * 1000);
+    }
+    const jsonMatch = message.match(/"retryDelay"\s*:\s*"(\d+\.?\d*)s"/);
+    if (jsonMatch) {
+      return Math.ceil(parseFloat(jsonMatch[1]) * 1000);
+    }
+    return undefined;
+  }
+
   private handleError(error: any): AIServiceError {
     const message = error.message || 'Unknown error occurred';
     const statusCode = error.status ?? error.statusCode;
@@ -170,7 +187,8 @@ export class GeminiProvider implements IAIProvider {
         `Rate limit exceeded: ${message}`,
         AIErrorType.RATE_LIMIT,
         AIProvider.GEMINI,
-        429
+        429,
+        this.parseRetryAfterMs(message),
       );
     }
     if (statusCode === 403 || message.includes('quota') || message.includes('permission') || message.includes('not found') || message.includes('does not exist')) {
