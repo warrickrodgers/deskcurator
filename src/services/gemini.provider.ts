@@ -27,7 +27,7 @@ export class GeminiProvider implements IAIProvider {
     this.client = new GoogleGenerativeAI(config.apiKey);
     this.modelConfig = {
       provider: AIProvider.GEMINI,
-      model: config.model || 'gemini-2.0-flash-exp',
+      model: config.model || 'gemini-2.5-flash',
     };
     this.model = this.client.getGenerativeModel({ model: this.modelConfig.model });
   }
@@ -163,18 +163,27 @@ export class GeminiProvider implements IAIProvider {
 
   private handleError(error: any): AIServiceError {
     const message = error.message || 'Unknown error occurred';
+    const statusCode = error.status ?? error.statusCode;
 
-    if (message.includes('quota') || message.includes('rate limit')) {
+    if (statusCode === 429 || (statusCode !== 403 && (message.includes('rate limit') || message.includes('RESOURCE_EXHAUSTED')))) {
       return new AIServiceError(
-        'Rate limit exceeded',
+        `Rate limit exceeded: ${message}`,
         AIErrorType.RATE_LIMIT,
         AIProvider.GEMINI,
         429
       );
     }
-    if (message.includes('API key') || message.includes('authentication')) {
+    if (statusCode === 403 || message.includes('quota') || message.includes('permission') || message.includes('not found') || message.includes('does not exist')) {
       return new AIServiceError(
-        'Invalid API key',
+        `Model access error (check model name/API tier): ${message}`,
+        AIErrorType.INVALID_REQUEST,
+        AIProvider.GEMINI,
+        statusCode ?? 403
+      );
+    }
+    if (message.includes('API key') || message.includes('authentication') || statusCode === 401) {
+      return new AIServiceError(
+        `Invalid API key: ${message}`,
         AIErrorType.AUTHENTICATION,
         AIProvider.GEMINI,
         401
@@ -196,6 +205,6 @@ export class GeminiProvider implements IAIProvider {
       );
     }
 
-    return new AIServiceError(message, AIErrorType.UNKNOWN, AIProvider.GEMINI, error.statusCode);
+    return new AIServiceError(message, AIErrorType.UNKNOWN, AIProvider.GEMINI, statusCode);
   }
 }

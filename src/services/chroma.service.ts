@@ -6,7 +6,7 @@ import { ResearchFindings } from '../types';
 
 const COLLECTION_NAME = 'product_research';
 const SIMILARITY_THRESHOLD = 0.85;
-const EMBEDDING_MODEL = 'text-embedding-004';
+const EMBEDDING_MODEL = 'gemini-embedding-001';
 
 export class ChromaService {
   private client: ChromaClient;
