@@ -18,10 +18,13 @@ import config from '../config/env';
 import logger from '../utils/logger';
 import { ApprovalRequest } from '../types';
 
+type ResearchCommandHandler = (productQuery: string) => Promise<void>;
+
 export class DiscordService {
   private client: Client;
   private isReady: boolean = false;
   private pendingApprovals: Map<string, ApprovalRequest> = new Map();
+  private researchHandler: ResearchCommandHandler | null = null;
 
   constructor() {
     this.client = new Client({
@@ -42,8 +45,37 @@ export class DiscordService {
       this.isReady = true;
     });
 
-    // Button interactions are handled within requestApproval method
-    // No global handler needed
+    // Listen for !research <product name> commands from the admin
+    this.client.on('messageCreate', async (message) => {
+      // Only respond to admin in the notification channel
+      if (
+        message.author.id !== config.discord.adminUserId ||
+        message.channelId !== config.discord.notificationChannelId ||
+        message.author.bot
+      ) {
+        return;
+      }
+
+      const prefix = '!research ';
+      if (!message.content.startsWith(prefix)) return;
+
+      const productQuery = message.content.slice(prefix.length).trim();
+      if (!productQuery) {
+        await message.reply('Usage: `!research <product name>`');
+        return;
+      }
+
+      if (!this.researchHandler) {
+        await message.reply('Research agent not initialized yet.');
+        return;
+      }
+
+      await message.reply(`Starting research for: **${productQuery}**...`);
+      this.researchHandler(productQuery).catch(async (err) => {
+        logger.error('Research command failed:', err);
+        await message.reply(`Research failed: ${err.message}`).catch(() => {});
+      });
+    });
 
     this.client.on('error', (error) => {
       logger.error('Discord client error:', error);
@@ -304,6 +336,14 @@ export class DiscordService {
     return EmbedBuilder.from(embed)
       .setColor(statusColor[status])
       .setFooter({ text: `${statusEmoji[status]} ${status.toUpperCase()}` });
+  }
+
+  /**
+   * Register a handler that fires when the admin types !research <product>
+   */
+  registerResearchHandler(handler: ResearchCommandHandler): void {
+    this.researchHandler = handler;
+    logger.info('Research command handler registered (!research <product>)');
   }
 
   getClient(): Client {

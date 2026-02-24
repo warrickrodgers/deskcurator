@@ -1,259 +1,332 @@
-# 🗺️ DeskCurator Development Roadmap
+# DeskCurator Development Roadmap
 
-**Current Phase:** Phase 0 - Foundation ✅ COMPLETE  
-**Next Phase:** Phase 1 - AI Integration  
-**Last Updated:** January 13, 2026
+**Current Phase:** Phase 2 - Product Research & Storage COMPLETE
+**Next Phase:** Phase 3 - Content Writer Agent
+**Last Updated:** February 23, 2026
 
 ---
 
-## Phase 0: Foundation ✅ COMPLETE
+## Phase 0: Foundation COMPLETE
 
 ### Infrastructure
 - [x] TypeScript configuration
 - [x] Discord bot setup with interactive buttons
-- [x] Environment configuration with validation
-- [x] Logger utility with file output
+- [x] Environment configuration with validation (Zod)
+- [x] Logger utility with file output (Winston)
 - [x] Type definitions
 - [x] Project structure
 - [x] Bot successfully connects and sends notifications
 
-**Status:** ✅ Bot is operational and ready for feature development
+**Status:** Bot is operational and ready for feature development
 
 ---
 
-## Phase 1: AI Integration 🎯 CURRENT PHASE
+## Phase 1: AI Integration COMPLETE
 
 **Objective:** Enable AI-powered content generation and analysis
 
-### 1.1 Anthropic/Claude Service (`src/services/anthropic.ts`)
-- [ ] API client integration
-- [ ] Request/response handling
-- [ ] Streaming response support
-- [ ] Error handling and retries
-- [ ] Rate limiting
-- [ ] Token usage tracking
+### 1.1 AI Providers
+- [x] Gemini provider (`src/services/gemini.provider.ts`) — streaming, error handling, retries
+- [x] Anthropic/Claude provider (`src/services/anthropic.provider.ts`) — streaming support
+- [x] Shared `IAIProvider` interface — providers are interchangeable
+- [x] Active provider switchable via `config.ai.provider` (currently Gemini `gemini-2.5-flash`)
 
-### 1.2 Prompt Templates (`src/prompts/`)
-- [ ] Create prompts directory structure
-- [ ] Product research prompt template
-- [ ] Product analysis prompt template
-- [ ] Competitor analysis prompt template
-- [ ] Content generation prompt template
-- [ ] Prompt testing utilities
+### 1.2 AI Service (`src/services/ai.service.ts`)
+- [x] Provider selection and initialization
+- [x] Rate limiting (token bucket, configurable per provider)
+- [x] Exponential backoff retry logic (`src/utils/retry.ts`)
+- [x] Token usage tracking across providers
+- [x] Streaming and non-streaming completion support
+- [x] Simple `ask()` helper for single-turn prompts
 
-### 1.3 AI Service Testing
-- [ ] Test basic completion requests
-- [ ] Test streaming responses
-- [ ] Test error handling
-- [ ] Verify prompt quality
-- [ ] Integration test with Discord approval flow
+### 1.3 Prompt Templates (`src/agents/content-researcher/context/`)
+- [x] System prompt for ContentResearcher agent
+- [x] Pros/cons analysis prompt
+- [x] Competitor analysis prompt
+- [x] Affiliate summary generation prompt
 
-**Estimated Time:** 1-2 hours  
-**Dependencies:** Anthropic API key  
-**Deliverables:** Working AI service that can analyze products and generate content
+### 1.4 AI Service Testing
+- [x] Logger utility tests (`tests/utils/logger.test.ts`)
+- [x] RateLimiter unit tests (`tests/utils/rateLimiter.test.ts`)
+- [x] Application startup/shutdown integration tests (`tests/index.test.ts`)
 
----
-
-## Phase 2: Product Research 🔜 NEXT
-
-**Objective:** Enable automated product discovery and data collection
-
-### 2.1 Amazon Product Search (`src/services/amazon.ts`)
-- [ ] Choose approach: Product Advertising API vs Web Scraping
-- [ ] Product search functionality
-- [ ] Specification extraction
-- [ ] Review parsing and sentiment analysis
-- [ ] Price tracking
-- [ ] Affiliate link generation with tracking tag
-- [ ] Product image retrieval
-
-### 2.2 Web Scraper (`src/utils/scraper.ts`)
-- [ ] HTTP client setup with user agents
-- [ ] HTML parsing (Cheerio/Puppeteer)
-- [ ] Product spec extraction patterns
-- [ ] Review scraping
-- [ ] Source credibility verification
-- [ ] Rate limiting and polite scraping
-- [ ] Error handling for blocked requests
-
-### 2.3 Data Validation & Storage
-- [ ] Product data validation schemas
-- [ ] Caching layer for product data
-- [ ] Source tracking and attribution
-
-**Estimated Time:** 2-3 hours  
-**Dependencies:** Phase 1 completion  
-**Deliverables:** Ability to find and extract detailed product information
+**Deliverables:** Working AI service with dual-provider support, rate limiting, retries, and token tracking
 
 ---
 
-## Phase 3: Enhanced ContentResearcher Agent 📋 PLANNED
+## Phase 2: Product Research & Storage COMPLETE
 
-**Objective:** Build a fully autonomous research agent with quality controls
+**Objective:** Enable automated product research and data persistence
 
-### 3.1 Product Research Capabilities
-- [ ] Integrate AI service with product search
-- [ ] Multi-source product lookup
-- [ ] Specification aggregation from multiple sources
-- [ ] Review analysis and summarization
-- [ ] Price comparison across sellers
+> **Approach change:** Amazon Product Advertising API / web scraping replaced with
+> Tavily AI search API — faster to ship, no scraping maintenance, better result quality.
 
-### 3.2 Analysis & Scoring
-- [ ] AI-powered pros/cons analysis
-- [ ] Source credibility scoring system
-- [ ] Confidence calculation improvements
-- [ ] Competitor identification and analysis
-- [ ] Market positioning assessment
+### 2.1 Web Search (`src/services/search.service.ts`)
+- [x] Tavily API integration
+- [x] Three parallel searches per product: general info, reviews, competitors
+- [x] Result count and source tracking
 
-### 3.3 Quality Validation
-- [ ] Fact-checking against multiple sources
-- [ ] Detect promotional/biased language
-- [ ] Verify technical specifications
-- [ ] Cross-reference review data
-- [ ] Flag low-confidence findings
+### 2.2 ContentResearcher Agent (`src/agents/content-researcher/ContentResearcher.ts`)
+- [x] End-to-end research pipeline (search → AI analysis → findings)
+- [x] Semantic deduplication via ChromaDB (skip recently researched products)
+- [x] Multi-source web search (info + review + competitor results)
+- [x] AI-powered pros/cons analysis
+- [x] AI-powered competitor analysis
+- [x] Affiliate summary generation
+- [x] Confidence scoring
+- [x] Discord approval flow integration
 
-### 3.4 Research Workflow
-- [ ] Automated research pipeline
-- [ ] Progress tracking and reporting
-- [ ] Retry logic for failed research
-- [ ] Research result caching
-- [ ] Batch research capabilities
+### 2.3 Vector Storage — ChromaDB (`src/services/chroma.service.ts`)
+- [x] ChromaDB client with cosine similarity collection
+- [x] Gemini embedding generation (`gemini-embedding-001`)
+- [x] Research deduplication at 0.85 similarity threshold
+- [x] Store completed research embeddings for future dedup lookups
 
-**Estimated Time:** 3-4 hours  
-**Dependencies:** Phases 1 & 2 completion  
-**Deliverables:** Production-ready research agent that produces high-quality findings
+### 2.4 Relational Storage — SQLite (`src/services/database.service.ts`)
+- [x] SQLite via `better-sqlite3`
+- [x] Products, research jobs, and approval history tables
+- [x] Persistent job state across restarts
+
+### 2.5 Discord Bot Commands
+- [x] `!research <product>` command triggers full research workflow
+- [x] Interactive approval buttons (Approve / Request Changes)
+- [x] Research result notifications in configured channel
+- [x] Admin-only command gating
+
+**Deliverables:** Fully operational research bot — takes a product name in Discord, researches it, and returns AI-analyzed findings with an approval flow
 
 ---
 
-## Phase 4: Content Writer Agent 🚀 FUTURE
+## Phase 3: Content Writer Agent (Hybrid Queue-Based) 🎯 NEXT
 
-**Objective:** Generate publication-ready content from research
+**Objective:** Generate multi-product affiliate content with queue-based parallel research
 
-### 4.1 Content Generation
-- [ ] Article structure templates
-- [ ] AI-powered draft generation
-- [ ] Tone and style consistency
-- [ ] Call-to-action integration
-- [ ] Amazon affiliate link insertion
-- [ ] Image placement suggestions
+> **Architecture:** Hybrid approach — synchronous initial discovery + asynchronous parallel research queue
 
-### 4.2 SEO Optimization
-- [ ] Keyword research integration
-- [ ] Meta description generation
-- [ ] Header optimization (H1, H2, H3)
-- [ ] Internal linking suggestions
-- [ ] Alt text generation for images
+### 3.1 Database Schema Extensions (`src/services/database.service.ts`)
+- [ ] Add `research_jobs` table (id, type, status, query, findings, parentJobId, priority, etc.)
+- [ ] Add `article_jobs` table (id, title, type, status, researchJobIds, draftContent, etc.)
+- [ ] Add job status enum types (pending, in_progress, awaiting_approval, approved, rejected, completed, failed)
+- [ ] Add database methods: createResearchJob, updateResearchJob, getResearchJobs, createArticleJob, etc.
+- [ ] Add migration system for schema updates
 
-### 4.3 Quality Checks
-- [ ] Plagiarism detection
-- [ ] Grammar and spelling checks
+### 3.2 Job Queue Service (`src/services/jobQueue.service.ts`)
+- [ ] Job creation and priority management
+- [ ] Job status tracking and updates
+- [ ] Polling mechanism for pending jobs
+- [ ] Job relationship tracking (parent/child jobs)
+- [ ] Job retry logic with configurable max retries
+
+### 3.3 Update ContentResearcher Agent (Queue Support)
+- [ ] Add polling loop to check database for pending research jobs
+- [ ] Process jobs from database instead of only direct calls
+- [ ] Update job status throughout workflow (pending → in_progress → awaiting_approval → approved)
+- [ ] Link completed research to parent article jobs
+- [ ] Increment article's completed research count when job approved
+- [ ] Keep existing synchronous research capability for Writer's initial discovery phase
+
+### 3.4 ContentWriter Agent (`src/agents/content-writer/ContentWriter.ts`)
+
+#### Phase 1: Synchronous Initial Discovery
+- [ ] `createArticle(request)` method — hybrid workflow entry point
+- [ ] Call ContentResearcher **synchronously** for initial category/planning research
+- [ ] Request Discord approval for initial research
+- [ ] Extract categories/products from initial research findings
+
+#### Phase 2: Queue Parallel Research
+- [ ] Create ArticleJob in database (status: pending_research)
+- [ ] Create multiple ResearchJobs for each product/category (status: pending, priority: 7)
+- [ ] Link research jobs to article job (parentJobId, relatedJobIds)
+- [ ] Notify Discord: "✅ Initial research complete, 🔍 Queued N product research jobs"
+
+#### Phase 3: Polling & Article Generation
+- [ ] `pollForCompletedResearch()` — continuous polling loop (every 10 seconds)
+- [ ] Detect when all research jobs for an article are approved
+- [ ] Generate article using AI with all research findings
+- [ ] Request Discord approval for draft article
+- [ ] Publish on final approval
+
+### 3.5 Prompt Templates (`src/agents/content-writer/context/`)
+- [ ] System prompt for ContentWriter agent
+- [ ] Multi-product article generation prompt (intro, product sections, verdict, CTA)
+- [ ] Single-product article generation prompt
+- [ ] Initial discovery/planning prompt (for category extraction)
+- [ ] SEO meta description prompt
+
+### 3.6 Article Types Support
+- [ ] Single-product article: "Best Standing Desk for WFH"
+- [ ] Multi-product roundup: "5 Best Desk Items for WFH Setup"
+- [ ] Comparison article: "Product A vs Product B"
+- [ ] Category overview: "Standing Desks Buying Guide"
+
+### 3.7 Content Quality & SEO
+- [ ] Article structure templates (H1/H2/H3 hierarchy)
+- [ ] Amazon affiliate link insertion (using `AMAZON_AFFILIATE_TAG`)
+- [ ] Tone and style consistency (professional, helpful, not overly promotional)
 - [ ] Readability scoring
-- [ ] Fact verification against research
-- [ ] Brand voice consistency
+- [ ] Meta description generation
+- [ ] Keyword integration
 
-### 4.4 Publishing Workflow
-- [ ] Draft review and approval flow
-- [ ] Revision request handling
-- [ ] Final approval before publishing
-- [ ] Publishing platform integration (CMS)
-- [ ] Analytics tracking setup
+### 3.8 Discord Commands
+- [ ] `!write "<title>"` — Create multi-product article with hybrid workflow
+  - Example: `!write "5 Best Desk Items For Your WFH Setup"`
+- [ ] `!draft <jobId>` — Generate article from approved research (legacy single-product)
+- [ ] `!status` — Show pending article and research jobs
+- [ ] `!cancel <jobId>` — Cancel article or research job
 
-**Estimated Time:** 4-5 hours  
-**Dependencies:** Phase 3 completion  
-**Deliverables:** End-to-end content creation pipeline
+### 3.9 Publishing Workflow
+- [ ] Draft review and approval flow (Approve / Request Changes / Reject)
+- [ ] Revision request handling (feedback integration)
+- [ ] Export to markdown format
+- [ ] Export to CMS-ready format (future: WordPress, Ghost, etc.)
+- [ ] Track published article URLs
+
+**Dependencies:** Phase 2 complete ✅  
+**Estimated Time:** 4-6 hours  
+**Deliverables:** 
+- Queue-based job system operational
+- Writer can create multi-product articles via hybrid sync/async workflow
+- Full Discord command set for article management
+- Publication-ready content with affiliate links
 
 ---
 
-## Phase 5: Advanced Features 🌟 FUTURE
+## Architecture Pattern: Hybrid Sync/Async
 
-**Ideas for future expansion:**
+```
+User: !write "5 Best Desk Items For Your WFH Setup"
+  ↓
+Writer (SYNC): Research categories directly
+  ↓ (waits)
+Researcher: Returns [Desks, Chairs, Monitors, Lamps, Keyboards]
+  ↓
+Writer (ASYNC): Creates 5 parallel ResearchJobs in database
+  ↓
+Researcher (polling): Processes jobs independently
+  ↓
+Writer (polling): Waits for all 5 approved
+  ↓
+Writer (SYNC): Generates final article
+  ↓
+Discord: Final approval
+  ↓
+Publish! 🚀
+```
+
+**Why Hybrid?**
+- ✅ Fast initial discovery (sync = no polling delay)
+- ✅ Efficient parallel research (async = 5 products at once)
+- ✅ Resumable (jobs persist in database)
+- ✅ Trackable (clear status per job)
+- ✅ Scalable (can add more researcher instances)
+
+**When to Use Sync vs Async:**
+- **Sync:** Planning/discovery, fast decisions, sequential dependencies
+- **Async:** Parallel work, long tasks, resumability needed
+
+---
+
+## Phase 4: Product Analyzer Agent PLANNED
+
+**Objective:** Deeper product intelligence — spec comparison and market positioning
+
+### 4.1 ProductAnalyzer Agent (`src/agents/product-analyzer/ProductAnalyzer.ts`)
+- [ ] Spec extraction and normalization
+- [ ] Price comparison across multiple sellers
+- [ ] Specification table generation
+- [ ] Market positioning assessment (budget / mid-range / premium)
+
+### 4.2 Amazon Integration
+- [ ] Affiliate link generation (env var `AMAZON_AFFILIATE_TAG` already wired)
+- [ ] Product image retrieval
+- [ ] Price and availability checking
+
+---
+
+## Phase 5: Advanced Features FUTURE
 
 ### 5.1 Multi-Agent Coordination
-- [ ] Agent communication protocol
-- [ ] Task queue management
+- [ ] Agent task handoff protocol
 - [ ] Priority-based scheduling
-- [ ] Conflict resolution
+- [ ] Batch research for multiple products
 
 ### 5.2 Analytics & Reporting
 - [ ] Research quality metrics
 - [ ] Content performance tracking
 - [ ] Affiliate link click tracking
-- [ ] ROI analysis
-- [ ] Dashboard for monitoring
+- [ ] `!stats` Discord dashboard command
 
 ### 5.3 Automation & Scheduling
-- [ ] Scheduled research tasks
-- [ ] Automated content publishing
+- [ ] Scheduled / recurring research tasks
 - [ ] Trend detection and alerting
 - [ ] Seasonal product recommendations
 
-### 5.4 Data Management
-- [ ] Database integration (PostgreSQL/MongoDB)
-- [ ] Research history tracking
-- [ ] Product catalog management
-- [ ] Content versioning
+### 5.4 Infrastructure
+- [ ] Migrate SQLite to PostgreSQL for production scale
+- [ ] Docker Compose for ChromaDB + app
+- [ ] CI/CD pipeline
 
 ---
 
-## 📊 Progress Tracking
+## Progress Tracking
 
-### Overall Completion: 20% (Phase 0 complete)
+### Overall Completion: ~55% (Phases 0-2 complete)
 
 | Phase | Status | Completion | Notes |
 |-------|--------|------------|-------|
-| Phase 0: Foundation | ✅ Complete | 100% | Bot operational |
-| Phase 1: AI Integration | 🎯 Current | 0% | Starting now |
-| Phase 2: Product Research | 🔜 Next | 0% | After Phase 1 |
-| Phase 3: Enhanced Agent | 📋 Planned | 0% | - |
-| Phase 4: Content Writer | 🚀 Future | 0% | - |
-| Phase 5: Advanced Features | 🌟 Future | 0% | - |
+| Phase 0: Foundation | Complete | 100% | Bot operational |
+| Phase 1: AI Integration | Complete | 100% | Gemini + Anthropic, rate limiting, retries, token tracking |
+| Phase 2: Product Research | Complete | 100% | Tavily search, ChromaDB, SQLite, full Discord flow |
+| Phase 3: Content Writer | Next | 0% | Skeleton exists in ContentWriter.ts |
+| Phase 4: Product Analyzer | Planned | 5% | Skeleton exists in ProductAnalyzer.ts |
+| Phase 5: Advanced Features | Future | 0% | — |
 
 ---
 
-## 🎯 Current Priorities
+## Current Priorities
 
-**Immediate Next Steps (Phase 1):**
-1. Create `src/services/anthropic.ts` with API integration
-2. Set up `src/prompts/` directory with template files
-3. Test AI service with simple completion
-4. Integrate AI service with ContentResearcher agent
-5. Test full workflow: research → AI analysis → Discord approval
+**Immediate Next Steps (Phase 3):**
+1. Implement `ContentWriter.ts` — generate article draft from `ResearchFindings`
+2. Add prompts to `src/agents/content-writer/context/`
+3. Extend Discord approval flow for draft review and revision requests
+4. Add `!draft <jobId>` Discord command
 
-**Blockers:** None  
-**Dependencies:** Anthropic API key (should be in .env)
+**Blockers:** None
+**Dependencies:** Phase 2 complete
 
 ---
 
-## 📝 Notes & Decisions
+## Notes & Decisions
 
 ### Technology Choices
-- **AI Provider:** Anthropic Claude (primary), OpenAI GPT (backup)
-- **Product Data:** Web scraping preferred over API (more flexibility)
-- **Scraping Tool:** Axios + Cheerio for simple sites, Puppeteer for JavaScript-heavy sites
-- **Database:** TBD - start with in-memory/file cache, migrate to DB later
+- **AI Provider:** Google Gemini `gemini-2.5-flash` (primary), Anthropic Claude (available, swap via config)
+- **Embeddings:** `gemini-embedding-001` (only model available on current free-tier API key)
+- **Web Search:** Tavily API (replaced planned Amazon scraper)
+- **Vector DB:** ChromaDB (local, cosine similarity, 0.85 dedup threshold)
+- **Relational DB:** SQLite via `better-sqlite3` (migrate to PostgreSQL for production)
 
 ### Quality Standards
 - All research must have ≥70% confidence score
-- Minimum 3 sources for any claim
 - Human approval required before content generation
 - No content published without final review
 
 ### Development Principles
 - Build incrementally and test each phase
 - Maintain type safety throughout
-- Log everything for debugging
+- Log everything (Winston, file + console)
 - Fail gracefully with helpful error messages
 
 ---
 
-## 🔄 Update History
+## Update History
 
-- **2026-01-13:** Project initialized, Phase 0 completed, Discord bot operational
-- **2026-01-13:** Created roadmap document, starting Phase 1
+- **2026-01-13:** Project initialized, Phase 0 complete, Discord bot operational
+- **2026-01-13:** Roadmap created, Phase 1 started
+- **2026-02-23:** Phases 1 & 2 complete — dual AI providers, Tavily web search, ChromaDB embeddings, SQLite storage, full ContentResearcher agent operational and communicating via Discord
 
 ---
 
-## 📌 Quick Commands Reference
+## Quick Commands Reference
 
 ```bash
 # Start development server
@@ -262,8 +335,11 @@ npm run dev
 # Build project
 npm run build
 
-# Check TypeScript errors
-npm run build
+# Run tests
+npm test
+
+# Lint
+npm run lint
 
 # View logs
 tail -f logs/combined.log
@@ -272,4 +348,4 @@ tail -f logs/error.log
 
 ---
 
-**Remember:** Update this document as you complete tasks! Check off items with `[x]` and move the "Current Phase" marker forward.
+**Remember:** Update this document as you complete tasks. Check off items with `[x]` and advance the "Current Phase" header.

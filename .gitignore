@@ -31,3 +31,4 @@ coverage/
 
 # TypeScript
 *.tsbuildinfo
+data/
