@@ -45,6 +45,16 @@ async function main() {
     const contentResearcher = new ContentResearcher();
     await contentResearcher.start();
 
+    // Register Discord command: !research <product name>
+    discordService.registerResearchHandler(async (productQuery) => {
+      const result = await contentResearcher.researchProduct(productQuery);
+      if (!result) {
+        await discordService.sendNotification(
+          `Research for **${productQuery}** was skipped (duplicate) or rejected.`
+        );
+      }
+    });
+
     // Graceful shutdown handlers
     const shutdown = async (signal: string) => {
       logger.info(`Received ${signal}, shutting down gracefully...`);
