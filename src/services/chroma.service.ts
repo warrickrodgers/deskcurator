@@ -42,14 +42,15 @@ export class ChromaService {
   }
 
   /**
-   * Returns true if research with >= 0.85 cosine similarity already exists.
-   * Fails open — returns false if ChromaDB is unavailable.
+   * Returns cached ResearchFindings if research with >= SIMILARITY_THRESHOLD cosine similarity
+   * already exists, so the caller can recycle it instead of re-running the full pipeline.
+   * Returns null if no match is found or if ChromaDB is unavailable (fails open).
    */
-  async hasSimilarResearch(
+  async getSimilarResearch(
     productName: string,
     category: string,
     searchQuery: string
-  ): Promise<boolean> {
+  ): Promise<ResearchFindings | null> {
     if (!this.collection) throw new Error('ChromaService not initialized');
 
     try {
@@ -59,11 +60,12 @@ export class ChromaService {
       const results = await this.collection.query({
         queryEmbeddings: [embedding],
         nResults: 1,
+        include: ['distances', 'documents'] as any,
       });
 
       const distances = results.distances?.[0];
       if (!distances || distances.length === 0 || distances[0] == null) {
-        return false;
+        return null;
       }
 
       // ChromaDB cosine space returns distance (0=identical, 1=orthogonal).
@@ -72,10 +74,33 @@ export class ChromaService {
       logger.debug(
         `ChromaDB similarity for "${productName}": ${similarity.toFixed(3)} (threshold: ${SIMILARITY_THRESHOLD})`
       );
-      return similarity >= SIMILARITY_THRESHOLD;
+
+      if (similarity < SIMILARITY_THRESHOLD) {
+        return null;
+      }
+
+      // Attempt to deserialise the stored findings. Older entries stored only
+      // metadata (no full findings JSON) — those fall through to a fresh run.
+      const doc = results.documents?.[0]?.[0];
+      if (!doc) return null;
+
+      try {
+        const parsed = JSON.parse(doc) as ResearchFindings;
+        // Distinguish full findings (has pros array) from legacy metadata docs
+        if (Array.isArray(parsed.pros)) {
+          logger.info(
+            `ChromaDB cache hit for "${productName}" (similarity ${similarity.toFixed(3)}) — recycling existing research`
+          );
+          return parsed;
+        }
+      } catch {
+        // Malformed document — fall through to fresh research
+      }
+
+      return null;
     } catch (error) {
       logger.warn('ChromaDB similarity check failed — proceeding with research:', error);
-      return false;
+      return null;
     }
   }
 
@@ -97,13 +122,9 @@ export class ChromaService {
       );
       const embedding = await this.generateEmbedding(text);
 
-      const document = JSON.stringify({
-        productName: findings.product.name,
-        category: findings.product.category,
-        summary: findings.summary,
-        confidence: findings.confidence,
-        searchQuery,
-      });
+      // Store the full ResearchFindings so cache hits can recycle the data without
+      // re-running the research pipeline.
+      const document = JSON.stringify(findings);
 
       await this.collection.upsert({
         ids: [jobId],

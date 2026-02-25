@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import * as fs from 'fs';
 import * as path from 'path';
 import logger from '../utils/logger';
+import { QueueResearchJob, ArticleJob, ResearchJobStatus, ArticleJobStatus } from '../types/jobs';
 
 const DB_PATH = path.join(process.cwd(), 'data', 'deskcurator.db');
 
@@ -84,7 +85,50 @@ export class DatabaseService {
         responded_at TEXT,
         FOREIGN KEY (research_job_id) REFERENCES research_jobs(id)
       );
+
+      CREATE TABLE IF NOT EXISTS queue_research_jobs (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL CHECK(type IN ('product','category','comparison')),
+        status TEXT NOT NULL CHECK(status IN ('pending','in_progress','awaiting_approval','approved','rejected','failed')),
+        priority INTEGER NOT NULL DEFAULT 5,
+        query TEXT NOT NULL,
+        requested_by TEXT NOT NULL CHECK(requested_by IN ('writer','user')),
+        parent_job_id TEXT,
+        findings TEXT,
+        discord_message_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        started_at TEXT,
+        completed_at TEXT,
+        failure_reason TEXT,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        max_retries INTEGER NOT NULL DEFAULT 3
+      );
+
+      CREATE TABLE IF NOT EXISTS article_jobs (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL CHECK(status IN ('pending_research','writing','awaiting_approval','approved','rejected','published','failed')),
+        title TEXT NOT NULL,
+        article_type TEXT NOT NULL CHECK(article_type IN ('single_product','multi_product','comparison','roundup')),
+        research_job_ids TEXT NOT NULL DEFAULT '[]',
+        required_research_count INTEGER NOT NULL DEFAULT 0,
+        completed_research_count INTEGER NOT NULL DEFAULT 0,
+        draft_content TEXT,
+        final_content TEXT,
+        discord_message_id TEXT,
+        discord_thread_id TEXT,
+        published_url TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT,
+        published_at TEXT
+      );
     `);
+
+    // Additive migrations — safe to run on existing DBs
+    try {
+      this.conn.exec(`ALTER TABLE article_jobs ADD COLUMN discord_thread_id TEXT`);
+    } catch {
+      // Column already exists — no-op
+    }
   }
 
   // ── Products ──────────────────────────────────────────────────────────────
@@ -167,6 +211,242 @@ export class DatabaseService {
          WHERE id = ?`
       )
       .run(status, feedback ?? null, id);
+  }
+
+  // ── Queue Research Jobs ───────────────────────────────────────────────────
+
+  createQueueResearchJob(job: {
+    id: string;
+    type: QueueResearchJob['type'];
+    query: string;
+    requestedBy: QueueResearchJob['requestedBy'];
+    parentJobId?: string;
+    priority?: number;
+    maxRetries?: number;
+  }): void {
+    this.conn
+      .prepare(
+        `INSERT INTO queue_research_jobs
+           (id, type, status, priority, query, requested_by, parent_job_id, retry_count, max_retries)
+         VALUES (@id, @type, 'pending', @priority, @query, @requestedBy, @parentJobId, 0, @maxRetries)`
+      )
+      .run({
+        ...job,
+        priority: job.priority ?? 5,
+        parentJobId: job.parentJobId ?? null,
+        maxRetries: job.maxRetries ?? 3,
+      });
+  }
+
+  updateQueueResearchJob(
+    id: string,
+    fields: Partial<{
+      status: ResearchJobStatus;
+      findings: string;
+      discordMessageId: string;
+      startedAt: string;
+      completedAt: string;
+      failureReason: string;
+      retryCount: number;
+    }>
+  ): void {
+    const setClauses: string[] = [];
+    const params: Record<string, unknown> = { id };
+
+    if (fields.status !== undefined) { setClauses.push('status = @status'); params.status = fields.status; }
+    if (fields.findings !== undefined) { setClauses.push('findings = @findings'); params.findings = fields.findings; }
+    if (fields.discordMessageId !== undefined) { setClauses.push('discord_message_id = @discordMessageId'); params.discordMessageId = fields.discordMessageId; }
+    if (fields.startedAt !== undefined) { setClauses.push('started_at = @startedAt'); params.startedAt = fields.startedAt; }
+    if (fields.completedAt !== undefined) { setClauses.push('completed_at = @completedAt'); params.completedAt = fields.completedAt; }
+    if (fields.failureReason !== undefined) { setClauses.push('failure_reason = @failureReason'); params.failureReason = fields.failureReason; }
+    if (fields.retryCount !== undefined) { setClauses.push('retry_count = @retryCount'); params.retryCount = fields.retryCount; }
+
+    if (setClauses.length === 0) return;
+    this.conn.prepare(`UPDATE queue_research_jobs SET ${setClauses.join(', ')} WHERE id = @id`).run(params);
+  }
+
+  private static readonly QUEUE_JOB_COLS = `
+    id, type, status, priority, query,
+    requested_by   AS requestedBy,
+    parent_job_id  AS parentJobId,
+    findings,
+    discord_message_id AS discordMessageId,
+    created_at     AS createdAt,
+    started_at     AS startedAt,
+    completed_at   AS completedAt,
+    failure_reason AS failureReason,
+    retry_count    AS retryCount,
+    max_retries    AS maxRetries
+  `;
+
+  getNextPendingResearchJob(): QueueResearchJob | undefined {
+    return this.conn
+      .prepare(
+        `SELECT ${DatabaseService.QUEUE_JOB_COLS}
+         FROM queue_research_jobs
+         WHERE status = 'pending'
+         ORDER BY priority DESC, created_at ASC
+         LIMIT 1`
+      )
+      .get() as QueueResearchJob | undefined;
+  }
+
+  /**
+   * Reset stale in_progress jobs whose started_at exceeds the given threshold.
+   * Jobs with retries remaining are returned to 'pending'; those without are marked 'failed'.
+   * Returns the number of jobs recovered.
+   */
+  recoverStaleInProgressJobs(thresholdMinutes = 30): number {
+    const threshold = `datetime('now', '-${thresholdMinutes} minutes')`;
+    const retried = this.conn
+      .prepare(
+        `UPDATE queue_research_jobs
+         SET status = 'pending',
+             retry_count = retry_count + 1,
+             failure_reason = 'Job timed out — recovered after stale threshold'
+         WHERE status = 'in_progress'
+           AND started_at < ${threshold}
+           AND retry_count < max_retries`
+      )
+      .run();
+    const exhausted = this.conn
+      .prepare(
+        `UPDATE queue_research_jobs
+         SET status = 'failed',
+             completed_at = datetime('now'),
+             failure_reason = 'Job timed out — no retries remaining'
+         WHERE status = 'in_progress'
+           AND started_at < ${threshold}
+           AND retry_count >= max_retries`
+      )
+      .run();
+    return (retried.changes ?? 0) + (exhausted.changes ?? 0);
+  }
+
+  getQueueResearchJobsByIds(ids: string[]): QueueResearchJob[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => '?').join(',');
+    return this.conn
+      .prepare(
+        `SELECT ${DatabaseService.QUEUE_JOB_COLS}
+         FROM queue_research_jobs
+         WHERE id IN (${placeholders})`
+      )
+      .all(...ids) as QueueResearchJob[];
+  }
+
+  getQueueResearchJobById(id: string): QueueResearchJob | undefined {
+    return this.conn
+      .prepare(
+        `SELECT ${DatabaseService.QUEUE_JOB_COLS}
+         FROM queue_research_jobs
+         WHERE id = ?`
+      )
+      .get(id) as QueueResearchJob | undefined;
+  }
+
+  // ── Article Jobs ──────────────────────────────────────────────────────────
+
+  createArticleJob(job: {
+    id: string;
+    title: string;
+    articleType: ArticleJob['articleType'];
+    status: ArticleJobStatus;
+    requiredResearchCount?: number;
+  }): void {
+    this.conn
+      .prepare(
+        `INSERT INTO article_jobs (id, status, title, article_type, required_research_count)
+         VALUES (@id, @status, @title, @articleType, @requiredResearchCount)`
+      )
+      .run({ ...job, requiredResearchCount: job.requiredResearchCount ?? 0 });
+  }
+
+  updateArticleJob(
+    id: string,
+    fields: Partial<{
+      status: ArticleJobStatus;
+      researchJobIds: string;
+      requiredResearchCount: number;
+      draftContent: string;
+      finalContent: string;
+      discordMessageId: string;
+      discordThreadId: string;
+      publishedUrl: string;
+      completedAt: string;
+      publishedAt: string;
+    }>
+  ): void {
+    const setClauses: string[] = [];
+    const params: Record<string, unknown> = { id };
+
+    if (fields.status !== undefined) { setClauses.push('status = @status'); params.status = fields.status; }
+    if (fields.researchJobIds !== undefined) { setClauses.push('research_job_ids = @researchJobIds'); params.researchJobIds = fields.researchJobIds; }
+    if (fields.requiredResearchCount !== undefined) { setClauses.push('required_research_count = @requiredResearchCount'); params.requiredResearchCount = fields.requiredResearchCount; }
+    if (fields.draftContent !== undefined) { setClauses.push('draft_content = @draftContent'); params.draftContent = fields.draftContent; }
+    if (fields.finalContent !== undefined) { setClauses.push('final_content = @finalContent'); params.finalContent = fields.finalContent; }
+    if (fields.discordMessageId !== undefined) { setClauses.push('discord_message_id = @discordMessageId'); params.discordMessageId = fields.discordMessageId; }
+    if (fields.discordThreadId !== undefined) { setClauses.push('discord_thread_id = @discordThreadId'); params.discordThreadId = fields.discordThreadId; }
+    if (fields.publishedUrl !== undefined) { setClauses.push('published_url = @publishedUrl'); params.publishedUrl = fields.publishedUrl; }
+    if (fields.completedAt !== undefined) { setClauses.push('completed_at = @completedAt'); params.completedAt = fields.completedAt; }
+    if (fields.publishedAt !== undefined) { setClauses.push('published_at = @publishedAt'); params.publishedAt = fields.publishedAt; }
+
+    if (setClauses.length === 0) return;
+    this.conn.prepare(`UPDATE article_jobs SET ${setClauses.join(', ')} WHERE id = @id`).run(params);
+  }
+
+  private static readonly ARTICLE_JOB_COLS = `
+    id, status, title,
+    article_type               AS articleType,
+    research_job_ids           AS researchJobIds,
+    required_research_count    AS requiredResearchCount,
+    completed_research_count   AS completedResearchCount,
+    draft_content              AS draftContent,
+    final_content              AS finalContent,
+    discord_message_id         AS discordMessageId,
+    discord_thread_id          AS discordThreadId,
+    published_url              AS publishedUrl,
+    created_at                 AS createdAt,
+    completed_at               AS completedAt,
+    published_at               AS publishedAt
+  `;
+
+  getArticleJobsByStatus(status: ArticleJobStatus): ArticleJob[] {
+    return this.conn
+      .prepare(
+        `SELECT ${DatabaseService.ARTICLE_JOB_COLS}
+         FROM article_jobs
+         WHERE status = ?`
+      )
+      .all(status) as ArticleJob[];
+  }
+
+  getArticleJobById(id: string): ArticleJob | undefined {
+    return this.conn
+      .prepare(
+        `SELECT ${DatabaseService.ARTICLE_JOB_COLS}
+         FROM article_jobs
+         WHERE id = ?`
+      )
+      .get(id) as ArticleJob | undefined;
+  }
+
+  getAllArticleJobs(): ArticleJob[] {
+    return this.conn
+      .prepare(
+        `SELECT ${DatabaseService.ARTICLE_JOB_COLS}
+         FROM article_jobs
+         ORDER BY created_at DESC`
+      )
+      .all() as ArticleJob[];
+  }
+
+  incrementArticleResearchCount(articleId: string): void {
+    this.conn
+      .prepare(
+        `UPDATE article_jobs SET completed_research_count = completed_research_count + 1 WHERE id = ?`
+      )
+      .run(articleId);
   }
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────

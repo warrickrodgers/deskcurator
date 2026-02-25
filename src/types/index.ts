@@ -39,3 +39,5 @@ export interface AgentConfig {
   role: string;
   enabled: boolean;
 }
+
+export { ArticleRequest, ArticleType, ArticleJob, QueueResearchJob, ResearchJobStatus, ArticleJobStatus, ResearchJobType } from './jobs';

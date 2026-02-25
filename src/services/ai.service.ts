@@ -22,6 +22,7 @@ import { AnthropicProvider } from './anthropic.provider';
 import { RateLimiter } from '../utils/rateLimiter';
 import { retryWithBackoff } from '../utils/retry';
 import logger from '../utils/logger';
+import discordService from './discord';
 
 export class AIService {
   private provider: IAIProvider;
@@ -29,6 +30,16 @@ export class AIService {
   private tokenTracker: TokenUsageTracker;
   private readonly maxRetries: number;
   private readonly retryDelay: number;
+
+  private async notifyRateLimit(waitMs: number, attempt: number): Promise<void> {
+    const waitSec = (waitMs / 1000).toFixed(0);
+    const msg = `⏳ **Gemini rate limit hit** (attempt ${attempt}/${this.maxRetries + 1}) — waiting **${waitSec}s** before retry.`;
+    try {
+      await discordService.sendNotification(msg, config.discord.writerChannelId);
+    } catch {
+      // Discord unavailable — already logged by the service; don't block the retry
+    }
+  }
 
   constructor() {
     // Initialize provider based on config
@@ -83,6 +94,7 @@ export class AIService {
         {
           maxRetries: this.maxRetries,
           baseDelay: this.retryDelay,
+          onWait: (waitMs, attempt) => this.notifyRateLimit(waitMs, attempt),
         }
       );
 
@@ -129,6 +141,7 @@ export class AIService {
         {
           maxRetries: this.maxRetries,
           baseDelay: this.retryDelay,
+          onWait: (waitMs, attempt) => this.notifyRateLimit(waitMs, attempt),
         }
       );
 

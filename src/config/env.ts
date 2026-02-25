@@ -7,7 +7,8 @@ const envSchema = z.object({
   DISCORD_BOT_TOKEN: z.string().min(1, 'Discord bot token is required'),
   DISCORD_CLIENT_ID: z.string().min(1, 'Discord client ID is required'),
   DISCORD_GUILD_ID: z.string().min(1, 'Discord guild ID is required'),
-  DISCORD_NOTIFICATION_CHANNEL_ID: z.string().min(1, 'Notification channel ID is required'),
+  DISCORD_RESEARCHER_CHANNEL_ID: z.string().min(1, 'Researcher channel ID is required'),
+  DISCORD_WRITER_CHANNEL_ID: z.string().min(1, 'Writer channel ID is required'),
   DISCORD_ADMIN_USER_ID: z.string().min(1, 'Admin user ID is required'),
   ANTHROPIC_API_KEY: z.string().optional(),
   GEMINI_API_KEY: z.string().min(1, 'Gemini API key is required'),
@@ -41,7 +42,8 @@ export const config = {
     token: env.DISCORD_BOT_TOKEN,
     clientId: env.DISCORD_CLIENT_ID,
     guildId: env.DISCORD_GUILD_ID,
-    notificationChannelId: env.DISCORD_NOTIFICATION_CHANNEL_ID,
+    researcherChannelId: env.DISCORD_RESEARCHER_CHANNEL_ID,
+    writerChannelId: env.DISCORD_WRITER_CHANNEL_ID,
     adminUserId: env.DISCORD_ADMIN_USER_ID,
   },
   ai: {
@@ -50,7 +52,7 @@ export const config = {
     // Gemini config (used by ai.service.ts and chroma.service.ts)
     gemini: {
       apiKey: env.GEMINI_API_KEY,
-      model: 'gemini-2.5-flash',
+      model: 'gemini-2.5-flash-lite',
       rateLimitPerMinute: 60,
       maxRetries: 3,
       retryDelay: 1000,

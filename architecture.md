@@ -1,617 +1,346 @@
-# 🏗️ Queue-Based Architecture Design
+# DeskCurator — Architecture
 
-**Phase:** Phase 2 - Content Writer with Queue System  
-**Purpose:** Enable multi-product articles with parallel research workflows  
-**Created:** January 13, 2026
-
----
-
-## 🎯 Vision: Multi-Product Article Example (Hybrid Approach)
-
-**User Command:**
-```
-!write "5 Best Desk Items For Your WFH Setup"
-```
-
-**System Workflow (Hybrid: Sync Initial + Queue Parallel):**
-1. Writer Agent receives request
-2. Writer calls Researcher **SYNCHRONOUSLY**: "Find top 5 WFH desk product categories"
-3. Researcher does research → Posts to Discord for approval
-4. Admin approves → Returns: [Standing Desks, Ergonomic Chairs, Monitor Arms, Desk Lamps, Keyboard Trays]
-5. Writer now has categories, creates **5 parallel Research Jobs** in database:
-   - Job #1: Research best standing desk
-   - Job #2: Research best ergonomic chair
-   - Job #3: Research best monitor arm
-   - Job #4: Research best desk lamp
-   - Job #5: Research best keyboard tray
-6. Writer creates ArticleJob in database (status: waiting_for_research)
-7. Researcher polls database, picks up jobs, processes them
-8. Each job posts to Discord for approval independently
-9. Writer polls database, waiting for all 5 research jobs to be approved
-10. Once all approved, Writer generates final article with all 5 products + affiliate links
-11. Final article posted to Discord for approval
-12. Publish!
-
-**Why This Hybrid Approach?**
-- ✅ **Fast Initial Discovery:** Synchronous call gets categories immediately, no polling delay
-- ✅ **Efficient Parallel Research:** Queue-based allows 5 products to be researched independently
-- ✅ **Resumable:** If bot crashes during parallel research, jobs persist
-- ✅ **Better UX:** User sees category results quickly, then parallel research begins
-- ✅ **Flexible:** Can do sync calls for fast decisions, queue for long-running parallel work
+**Status:** Phase 3 complete (ContentWriter agent operational)
+**Last Updated:** February 2026
 
 ---
 
-## 📊 Database Schema
+## Overview
 
-### ResearchJob Table
-```typescript
-interface ResearchJob {
-  id: string;                          // UUID
-  type: 'product' | 'category' | 'comparison';
-  status: 'pending' | 'in_progress' | 'awaiting_approval' | 'approved' | 'rejected' | 'completed' | 'failed';
-  priority: number;                    // 1-10, higher = more urgent
-  
-  // Request details
-  query: string;                       // "best standing desk for WFH"
-  category?: string;                   // "desk equipment"
-  additionalContext?: string;          // Extra instructions for researcher
-  
-  // Relationships
-  requestedBy: 'writer' | 'user';      // Who requested this research
-  parentJobId?: string;                // If part of multi-job article
-  relatedJobIds?: string[];            // Other jobs in same article
-  
-  // Results
-  findings?: ResearchFindings;         // Populated when complete
-  discordMessageId?: string;           // For tracking approval message
-  
-  // Metadata
-  createdAt: Date;
-  startedAt?: Date;
-  completedAt?: Date;
-  failureReason?: string;
-  retryCount: number;
-  maxRetries: number;
-}
+DeskCurator is a two-agent Discord bot for generating affiliate content about desk-setup products. The agents communicate via a SQLite job queue and interact with a human admin through separate Discord channels.
+
 ```
-
-### ArticleJob Table
-```typescript
-interface ArticleJob {
-  id: string;                          // UUID
-  status: 'pending_research' | 'research_complete' | 'writing' | 'awaiting_approval' | 'approved' | 'rejected' | 'published' | 'failed';
-  
-  // Article details
-  title: string;                       // "5 Best Desk Items For Your WFH Setup"
-  articleType: 'single_product' | 'multi_product' | 'comparison' | 'roundup';
-  targetWordCount?: number;
-  
-  // Research tracking
-  researchJobIds: string[];            // All research jobs for this article
-  requiredResearchCount: number;       // How many research jobs needed
-  completedResearchCount: number;      // How many are done
-  
-  // Content
-  outline?: string;                    // Article structure
-  draftContent?: string;               // Generated article
-  finalContent?: string;               // After edits
-  
-  // Publishing
-  discordMessageId?: string;           // Approval message
-  publishedUrl?: string;               // Where it was published
-  
-  // Metadata
-  createdAt: Date;
-  completedAt?: Date;
-  publishedAt?: Date;
-}
+Admin
+  │
+  ├── #content-researcher ──► ContentResearcher Agent
+  │                               │ Tavily search
+  │                               │ Gemini AI analysis
+  │                               │ ChromaDB dedup
+  │                               │ SQLite persistence
+  │
+  └── #writer-editor ────────► ContentWriter Agent
+          (threads per article)       │ Hybrid sync/async workflow
+                                      │ Reads from SQLite queue
+                                      │ Generates articles via AI
 ```
 
 ---
 
-## 🔄 Agent Workflows
+## Discord Channel Architecture
 
-### Writer Agent Workflow (Hybrid Approach)
+Two dedicated channels enforce strict separation of concerns:
 
-```typescript
-// src/agents/ContentWriter.ts
+| Channel | Agent | Commands | Notifications |
+|---|---|---|---|
+| `#content-researcher` | ContentResearcher | `!research <product>` | Research approval embeds, skip/reject notices |
+| `#writer-editor` | ContentWriter | `!write "<title>"`, `!status`, `!cancel <jobId>` | Article threads, startup message |
 
-class ContentWriter {
-  
-  async createArticle(request: ArticleRequest): Promise<void> {
-    try {
-      logger.info(`Starting article: "${request.title}"`);
-      
-      // PHASE 1: SYNCHRONOUS - Get initial research to make decisions
-      logger.info('Phase 1: Initial discovery (synchronous)...');
-      const initialResearch = await this.contentResearcher.research({
-        query: `Find top ${request.productCount} product categories for: ${request.topic}`,
-        type: 'category',
-      });
-      
-      // Request approval for initial research
-      const initialApproval = await discord.requestApproval({
-        type: 'research',
-        data: initialResearch,
-      });
-      
-      if (!initialApproval.approved) {
-        logger.info('Initial research rejected, aborting article');
-        return;
-      }
-      
-      // Extract categories from research
-      const categories = this.extractCategories(initialResearch);
-      logger.info(`Found ${categories.length} categories: ${categories.join(', ')}`);
-      
-      // PHASE 2: ASYNCHRONOUS - Queue parallel research jobs
-      logger.info('Phase 2: Creating parallel research jobs...');
-      
-      // Create article job
-      const articleJob = await db.createArticleJob({
-        title: request.title,
-        articleType: 'multi_product',
-        status: 'pending_research',
-      });
-      
-      // Create research jobs for each category
-      const researchJobs = await Promise.all(
-        categories.map(category => 
-          db.createResearchJob({
-            query: `Find the best ${category} for ${request.topic}`,
-            type: 'product',
-            parentJobId: articleJob.id,
-            requestedBy: 'writer',
-            priority: 7, // High priority for active article
-          })
-        )
-      );
-      
-      // Link research jobs to article
-      await db.updateArticleJob(articleJob.id, {
-        researchJobIds: researchJobs.map(j => j.id),
-        requiredResearchCount: researchJobs.length,
-      });
-      
-      // Notify Discord
-      await discord.sendNotification(
-        `📝 Article: "${request.title}"\n` +
-        `✅ Initial research complete: ${categories.length} categories found\n` +
-        `🔍 Queued ${researchJobs.length} product research jobs\n` +
-        `⏳ Waiting for research to complete...`
-      );
-      
-      logger.info(`Article ${articleJob.id} waiting for ${researchJobs.length} research jobs`);
-      
-    } catch (error) {
-      logger.error('Failed to create article:', error);
-      throw error;
-    }
-  }
-  
-  // Polling loop - runs continuously
-  async pollForCompletedResearch(): Promise<void> {
-    logger.info('Starting article polling loop...');
-    
-    while (true) {
-      try {
-        // Find articles waiting for research
-        const pendingArticles = await db.getArticleJobs({
-          status: 'pending_research',
-        });
-        
-        for (const article of pendingArticles) {
-          // Check if all research is done
-          const researchJobs = await db.getResearchJobs({
-            ids: article.researchJobIds,
-          });
-          
-          const allApproved = researchJobs.every(
-            job => job.status === 'approved'
-          );
-          
-          if (allApproved) {
-            logger.info(`All research complete for article ${article.id}, starting writing...`);
-            await this.writeArticle(article, researchJobs);
-          } else {
-            const completed = researchJobs.filter(j => j.status === 'approved').length;
-            logger.debug(
-              `Article ${article.id}: ${completed}/${researchJobs.length} research jobs complete`
-            );
-          }
-        }
-        
-      } catch (error) {
-        logger.error('Error in article polling loop:', error);
-      }
-      
-      // Poll every 10 seconds
-      await sleep(10000);
-    }
-  }
-  
-  private async writeArticle(
-    article: ArticleJob,
-    research: ResearchJob[]
-  ): Promise<void> {
-    try {
-      // Update status
-      await db.updateArticleJob(article.id, {
-        status: 'writing',
-      });
-      
-      logger.info(`Writing article ${article.id}...`);
-      
-      // Generate content using AI with all research findings
-      const content = await aiService.generateArticle({
-        title: article.title,
-        productCount: research.length,
-        research: research.map(r => r.findings),
-        includeAffiliateLinks: true,
-      });
-      
-      // Save draft
-      await db.updateArticleJob(article.id, {
-        draftContent: content,
-        status: 'awaiting_approval',
-      });
-      
-      logger.info(`Article ${article.id} draft complete, requesting approval...`);
-      
-      // Request approval
-      const approval = await discord.requestApproval({
-        type: 'content',
-        data: content,
-      });
-      
-      if (approval.approved) {
-        logger.info(`Article ${article.id} approved, publishing...`);
-        await this.publishArticle(article.id, content);
-      } else {
-        logger.info(`Article ${article.id} rejected`);
-        await db.updateArticleJob(article.id, {
-          status: 'rejected',
-        });
-        
-        if (approval.feedback) {
-          // TODO: Handle revision requests
-          logger.info(`Feedback received: ${approval.feedback}`);
-        }
-      }
-      
-    } catch (error) {
-      logger.error(`Failed to write article ${article.id}:`, error);
-      await db.updateArticleJob(article.id, {
-        status: 'failed',
-      });
-    }
-  }
-  
-  private async publishArticle(articleId: string, content: string): Promise<void> {
-    // TODO: Implement actual publishing logic
-    logger.info(`Publishing article ${articleId}...`);
-    
-    await db.updateArticleJob(articleId, {
-      status: 'published',
-      publishedAt: new Date(),
-      finalContent: content,
-    });
-    
-    await discord.sendNotification(
-      `🎉 Article published successfully!\n` +
-      `Article ID: ${articleId}`
-    );
-  }
-  
-  private extractCategories(research: ResearchFindings): string[] {
-    // Parse AI response to extract category list
-    // This would use the AI's structured output or parse from summary
-    // For now, simplified example:
-    const summary = research.summary;
-    // Extract categories from summary text
-    // TODO: Implement robust category extraction
-    return ['Standing Desk', 'Ergonomic Chair', 'Monitor Arm', 'Desk Lamp', 'Keyboard Tray'];
-  }
-}
+### Article Threads
+
+When `!write` is issued, ContentWriter creates a **public Discord thread** inside `#writer-editor` named after the article title. All article-level events post into that thread:
+
+- Phase 1 complete / categories identified
+- Parallel research jobs queued
+- Writing in progress
+- Draft approval embed (Approve / Reject / Request Edit)
+- Published confirmation
+
+Individual **research job approvals** always appear in `#content-researcher`, regardless of whether they were queued by the writer or triggered by `!research`.
+
+---
+
+## Agent Architecture
+
+### ContentResearcher
+
+**File:** [src/agents/content-researcher/ContentResearcher.ts](src/agents/content-researcher/ContentResearcher.ts)
+
+Runs two modes concurrently:
+
+1. **Direct research** — called synchronously by ContentWriter for initial category discovery, or triggered by `!research` command.
+2. **Queue polling** — polls `queue_research_jobs` every 5 seconds for pending writer-created jobs.
+
+```
+researchProduct(query)
+  │
+  ├─ ChromaDB dedup check (0.85 cosine similarity threshold)
+  ├─ Tavily: 3 parallel searches (info, reviews, competitors)
+  ├─ Gemini: pros/cons analysis (JSON)
+  ├─ Gemini: competitor analysis (JSON)
+  ├─ Gemini: affiliate summary
+  ├─ Confidence scoring
+  ├─ Store in ChromaDB
+  ├─ Persist to SQLite (products + research_jobs)
+  └─ Discord approval in #content-researcher
+       → approved: return ResearchFindings
+       → rejected: return null
 ```
 
-### Researcher Agent Workflow
+Queue job processing re-uses `researchProduct()` and then updates the `queue_research_jobs` row + increments the parent article's `completedResearchCount`.
 
-```typescript
-// src/agents/ContentResearcher.ts
+### ContentWriter
 
-class ContentResearcher {
-  
-  // Polling loop - runs continuously
-  async pollForPendingJobs(): Promise<void> {
-    while (true) {
-      // Find highest priority pending job
-      const job = await db.getNextResearchJob({
-        status: 'pending',
-        orderBy: 'priority DESC',
-        limit: 1,
-      });
-      
-      if (job) {
-        await this.processResearchJob(job);
-      }
-      
-      // Poll every 5 seconds
-      await sleep(5000);
-    }
-  }
-  
-  private async processResearchJob(job: ResearchJob): Promise<void> {
-    try {
-      // Mark as in progress
-      await db.updateResearchJob(job.id, {
-        status: 'in_progress',
-        startedAt: new Date(),
-      });
-      
-      // Do the actual research
-      const findings = await this.conductResearch(job.query, job.type);
-      
-      // Save findings
-      await db.updateResearchJob(job.id, {
-        findings,
-        status: 'awaiting_approval',
-      });
-      
-      // Request approval
-      const approval = await discord.requestApproval({
-        type: 'research',
-        data: findings,
-      });
-      
-      if (approval.approved) {
-        await db.updateResearchJob(job.id, {
-          status: 'approved',
-          completedAt: new Date(),
-        });
-        
-        // Increment completed count on parent article
-        if (job.parentJobId) {
-          await db.incrementArticleResearchCount(job.parentJobId);
-        }
-      } else {
-        await db.updateResearchJob(job.id, {
-          status: 'rejected',
-        });
-      }
-      
-    } catch (error) {
-      logger.error(`Research job ${job.id} failed:`, error);
-      
-      // Retry logic
-      if (job.retryCount < job.maxRetries) {
-        await db.updateResearchJob(job.id, {
-          status: 'pending',
-          retryCount: job.retryCount + 1,
-        });
-      } else {
-        await db.updateResearchJob(job.id, {
-          status: 'failed',
-          failureReason: error.message,
-        });
-      }
-    }
-  }
-}
+**File:** [src/agents/content-writer/ContentWriter.ts](src/agents/content-writer/ContentWriter.ts)
+
+Hybrid sync/async workflow:
+
+```
+createArticle(request)          ← triggered by !write
+  │
+  ├─ Create Discord thread in #writer-editor
+  │
+  ├─ [SYNC] Call contentResearcher.researchProduct(discoveryQuery)
+  │    → approval in #content-researcher
+  │    → extract categories from findings via AI
+  │
+  ├─ INSERT article_job (status: pending_research)
+  ├─ INSERT N × queue_research_jobs (status: pending, priority: 7)
+  └─ Notify thread: "Queued N research jobs"
+
+pollForCompletedResearch()      ← runs every 10s
+  │
+  └─ For each pending_research article:
+       Check all linked queue_research_jobs
+       All approved? → writeArticle()
+       All done but some failed? → writeArticle() with approved subset
+
+writeArticle(article, jobs)
+  │
+  ├─ Gemini: articleGenerationPrompt → markdown draft
+  ├─ Gemini: seoMetaPrompt → meta description
+  ├─ Update article_job (status: awaiting_approval, draftContent)
+  ├─ Discord approval in article thread
+  │    → approved: publishArticle()
+  └─   → rejected: update status, post feedback to thread
+
+publishArticle()
+  ├─ Write output/articles/<id>.md
+  ├─ Update article_job (status: published, finalContent, publishedAt)
+  └─ Notify thread: "Article published!"
 ```
 
 ---
 
-## 🗄️ Database Choice
+## Database Schema (SQLite)
 
-### Phase 2 Options:
+**File:** [src/services/database.service.ts](src/services/database.service.ts)
 
-**Option 1: SQLite (Recommended for MVP)**
-- ✅ Simple, file-based, no server needed
-- ✅ Perfect for single-instance bot
-- ✅ Easy to backup (just copy .db file)
-- ✅ TypeScript support via `better-sqlite3`
-- ❌ Not great for multiple bot instances
+### `products`
+Tracks product metadata created during `!research` flows.
 
-**Option 2: PostgreSQL (Production-ready)**
-- ✅ Robust, proven, widely used
-- ✅ Great for scaling to multiple bots
-- ✅ Advanced querying capabilities
-- ❌ Requires separate database server
-- ❌ More complex setup
+| Column | Type | Notes |
+|---|---|---|
+| id | TEXT PK | UUID |
+| name | TEXT | |
+| category | TEXT | |
+| price | REAL | optional |
+| url | TEXT | Amazon search URL |
+| affiliate_link | TEXT | optional |
+| created_at | TEXT | datetime |
 
-**Option 3: In-Memory + File Persistence (Quick Start)**
-- ✅ Zero dependencies initially
-- ✅ Use Map/Array in memory
-- ✅ Serialize to JSON file periodically
-- ❌ Not production-ready
-- ❌ Can lose data on crash
+### `research_jobs`
+Tracks legacy `!research` job runs (tied to a product).
 
-**Recommendation:** Start with **SQLite**, easy migration to PostgreSQL later.
+| Column | Type | Notes |
+|---|---|---|
+| id | TEXT PK | UUID |
+| product_id | TEXT FK | → products |
+| status | TEXT | pending / running / completed / failed |
+| confidence_score | REAL | |
+| search_query | TEXT | |
+| started_at | TEXT | |
+| completed_at | TEXT | |
+
+### `approval_history`
+Records every Discord approval interaction.
+
+| Column | Type | Notes |
+|---|---|---|
+| id | TEXT PK | |
+| research_job_id | TEXT FK | → research_jobs |
+| discord_message_id | TEXT | |
+| status | TEXT | pending / approved / rejected / needs_edit |
+| feedback | TEXT | from "Request Edit" flow |
+| created_at | TEXT | |
+| responded_at | TEXT | |
+
+### `queue_research_jobs`
+Writer-created research jobs processed by ContentResearcher's polling loop.
+
+| Column | Type | Notes |
+|---|---|---|
+| id | TEXT PK | UUID |
+| type | TEXT | product / category / comparison |
+| status | TEXT | pending / in_progress / awaiting_approval / approved / rejected / failed |
+| priority | INTEGER | 1–10, higher = sooner |
+| query | TEXT | e.g. "Best standing desk for WFH Setup" |
+| requested_by | TEXT | writer / user |
+| parent_job_id | TEXT | → article_jobs.id |
+| findings | TEXT | JSON-serialized ResearchFindings |
+| discord_message_id | TEXT | |
+| created_at / started_at / completed_at | TEXT | |
+| failure_reason | TEXT | |
+| retry_count / max_retries | INTEGER | default 0 / 3 |
+
+### `article_jobs`
+Tracks full article lifecycle from queue to publish.
+
+| Column | Type | Notes |
+|---|---|---|
+| id | TEXT PK | UUID |
+| status | TEXT | pending_research / writing / awaiting_approval / approved / rejected / published / failed |
+| title | TEXT | e.g. "5 Best Desk Items For Your WFH Setup" |
+| article_type | TEXT | single_product / multi_product / comparison / roundup |
+| research_job_ids | TEXT | JSON array of queue_research_job IDs |
+| required_research_count | INTEGER | |
+| completed_research_count | INTEGER | incremented on each approval |
+| draft_content | TEXT | AI-generated markdown |
+| final_content | TEXT | approved final version |
+| discord_message_id | TEXT | approval message |
+| discord_thread_id | TEXT | writer-editor thread for this article |
+| published_url | TEXT | future CMS URL |
+| created_at / completed_at / published_at | TEXT | |
 
 ---
 
-## 📁 File Structure
+## Service Layer
+
+### AI Service
+**File:** [src/services/ai.service.ts](src/services/ai.service.ts)
+
+Provider abstraction over Gemini and Anthropic. Features:
+- Swappable provider via `config.ai.provider`
+- Token bucket rate limiting per provider
+- Exponential backoff retry (up to `maxRetries`)
+- Token usage tracking
+- `ask(prompt, systemPrompt?)` — single-turn helper used by all agents
+
+**Active provider:** Gemini `gemini-2.5-flash`
+
+### ChromaDB Service
+**File:** [src/services/chroma.service.ts](src/services/chroma.service.ts)
+
+Vector store for research deduplication.
+- Embeddings via `gemini-embedding-001`
+- Cosine similarity collection
+- `hasSimilarResearch(name, category, query)` — returns true if similarity ≥ 0.85
+- `storeResearch(jobId, findings, query)` — stores after approval
+
+### Search Service
+**File:** [src/services/search.service.ts](src/services/search.service.ts)
+
+Wraps the Tavily API. Runs three parallel searches per product:
+- General product info
+- User reviews
+- Competitor landscape
+
+### Discord Service
+**File:** [src/services/discord.ts](src/services/discord.ts)
+
+Manages all Discord interactions:
+- **Channel routing** — `!research` only handled in researcher channel; `!write`/`!status`/`!cancel` only in writer channel
+- **`sendNotification(message, channelId?)`** — sends to researcher channel by default; accepts explicit channel or thread ID
+- **`requestApproval(request, channelId?)`** — posts embed with Approve / Reject / Request Edit buttons; waits for interaction
+- **`createArticleThread(title)`** — creates a public thread in the writer channel; returns thread ID
+- **Handler registration** — `registerResearchHandler`, `registerWriteHandler`, `registerStatusHandler`, `registerCancelHandler`
+
+### Job Queue Service
+**File:** [src/services/jobQueue.service.ts](src/services/jobQueue.service.ts)
+
+Thin wrapper over `databaseService` for queue semantics:
+- `enqueueResearch(params)` — creates a `queue_research_job` with defaults
+- `dequeueNext()` — atomically fetches the highest-priority pending job and marks it `in_progress`
+- `createArticle(params)` — creates an `article_job`
+
+### Database Service
+**File:** [src/services/database.service.ts](src/services/database.service.ts)
+
+SQLite via `better-sqlite3`. WAL mode, foreign keys enabled. All SELECT queries use explicit column aliases for snake_case → camelCase mapping. Additive migrations run on startup (safe on existing databases).
+
+---
+
+## Prompt Templates
+
+### ContentResearcher
+**File:** [src/agents/content-researcher/context/prompts.ts](src/agents/content-researcher/context/prompts.ts)
+
+| Prompt | Purpose |
+|---|---|
+| `analyzeProsConsPrompt` | Extract structured pros/cons JSON from search results |
+| `competitorPrompt` | Identify top 3–5 competitors with differentiators |
+| `summaryPrompt` | Write affiliate-optimised 3–4 paragraph summary |
+
+### ContentWriter
+**File:** [src/agents/content-writer/context/prompts.ts](src/agents/content-writer/context/prompts.ts)
+
+| Prompt | Purpose |
+|---|---|
+| `categoryDiscoveryPrompt` | Generate N product category names for an article title |
+| `categoryExtractionPrompt` | Parse N categories from an existing research summary |
+| `articleGenerationPrompt` | Write full markdown article (supports all 4 article types) |
+| `seoMetaPrompt` | Write a 150–160 char SEO meta description |
+
+---
+
+## End-to-End Example
 
 ```
-src/
-├── agents/
-│   ├── ContentResearcher.ts      # Polls for research jobs
-│   └── ContentWriter.ts          # Polls for completed research
-│
-├── services/
-│   ├── database.ts               # Database connection & queries
-│   ├── jobQueue.ts               # Job queue management
-│   └── anthropic.ts              # AI service (existing)
-│
-├── models/
-│   ├── ResearchJob.ts            # ResearchJob type & methods
-│   └── ArticleJob.ts             # ArticleJob type & methods
-│
-├── database/
-│   ├── schema.sql                # Database schema
-│   ├── migrations/               # Schema migrations
-│   └── seeds/                    # Test data
-│
-└── types/
-    └── jobs.ts                   # Job-related types
+T+0s   Admin: !write "5 Best Desk Items For Your WFH Setup"
+T+1s   Bot creates Discord thread: "5 Best Desk Items For Your WFH Setup"
+T+2s   Thread: "Phase 1: running initial discovery…"
+T+2s   ContentResearcher: researches "top 5 WFH desk product categories"
+T+12s  #content-researcher: approval embed for category research
+T+15s  Admin: Approve
+T+16s  Thread: "Phase 1 complete — 5 categories found:
+               1. Standing Desk  2. Ergonomic Chair  3. Monitor Arm
+               4. Desk Lamp  5. Keyboard Tray
+               Queued 5 research jobs"
+
+T+17s  queue_research_jobs: 5 rows inserted (status: pending)
+
+── ContentResearcher polls every 5s ──────────────────────────────────────────
+
+T+20s  Picks up job: "Best standing desk for WFH Setup"
+T+35s  #content-researcher: "Standing desk research" approval embed
+T+38s  Admin: Approve  →  job approved, article completedCount → 1/5
+
+T+40s  Picks up job: "Best ergonomic chair for WFH Setup"
+T+55s  Admin: Approve  →  completedCount → 2/5
+
+       … (repeat for monitor arm, desk lamp, keyboard tray) …
+
+T+4m   All 5 jobs approved, completedCount → 5/5
+
+── ContentWriter polls every 10s ─────────────────────────────────────────────
+
+T+4m   Detects all research complete for article
+T+4m   Thread: "Writing article… generating draft now…"
+T+5m   Gemini generates full markdown article + SEO meta
+T+5m   article_jobs: status → awaiting_approval
+T+5m   Thread: approval embed with article draft preview
+T+8m   Admin: Approve
+T+8m   output/articles/<id>.md written
+T+8m   Thread: "Article published! File: output/articles/<id>.md"
 ```
 
 ---
 
-## 🚀 Implementation Plan
+## Configuration Reference
 
-### Step 1: Database Setup
-- [ ] Choose database (SQLite recommended)
-- [ ] Create schema for ResearchJob and ArticleJob
-- [ ] Build database service with CRUD operations
-- [ ] Add migration system
+All config is in [src/config/env.ts](src/config/env.ts), validated with Zod on startup.
 
-### Step 2: Job Queue System
-- [ ] Implement job creation
-- [ ] Implement job status updates
-- [ ] Add polling mechanism
-- [ ] Add priority queuing
-
-### Step 3: Update Researcher Agent
-- [ ] Add polling loop for pending jobs
-- [ ] Process jobs from database instead of direct calls
-- [ ] Update job status throughout workflow
-- [ ] Handle retries and failures
-
-### Step 4: Build Writer Agent
-- [ ] Research planning logic (multi-step)
-- [ ] Create research jobs in database
-- [ ] Poll for completed research
-- [ ] Generate article when all research ready
-- [ ] Article approval workflow
-
-### Step 5: Discord Commands
-- [ ] `!research <query>` - Manual research job
-- [ ] `!write <title>` - Create article job
-- [ ] `!status` - Show pending/active jobs
-- [ ] `!cancel <job-id>` - Cancel job
-
----
-
-## 🎯 Example: "5 Desk Items" Article Flow (Hybrid)
-
-```
-T+0s:  User: "!write 5 Best Desk Items For Your WFH Setup"
-T+1s:  Writer: Starts article creation
-
-// PHASE 1: SYNCHRONOUS - Initial Discovery
-T+2s:  Writer: Calls Researcher DIRECTLY (synchronous)
-       Query: "Find top 5 WFH desk product categories"
-T+10s: Researcher: Completes research
-T+11s: Discord: "@Admin - Category research complete [Approve/Reject]"
-T+15s: Admin: Clicks "Approve"
-T+16s: Writer: Receives categories: [Standing Desks, Chairs, Monitor Arms, Lamps, Keyboards]
-
-// PHASE 2: ASYNCHRONOUS - Parallel Product Research
-T+17s: Writer: Creates ArticleJob (ID: art-123, status: pending_research)
-T+18s: Writer: Creates 5 ResearchJobs in database:
-       - res-001: "Best standing desk for WFH" (status: pending)
-       - res-002: "Best ergonomic chair for WFH" (status: pending)
-       - res-003: "Best monitor arm for WFH" (status: pending)
-       - res-004: "Best desk lamp for WFH" (status: pending)
-       - res-005: "Best keyboard tray for WFH" (status: pending)
-
-T+19s: Discord: "✅ Initial research complete: 5 categories found"
-              "🔍 Queued 5 product research jobs"
-              "⏳ Waiting for research to complete..."
-
-// Researcher polls database every 5 seconds, picks up jobs
-T+20s: Researcher: Picks up res-001 (standing desk)
-T+35s: Researcher: Completes res-001, requests approval
-T+36s: Discord: "@Admin - Standing desk research complete [Approve/Reject]"
-T+40s: Admin: Approves
-T+41s: Database: res-001 status → approved, art-123 completedCount → 1/5
-
-T+45s: Researcher: Picks up res-002 (chair)
-T+60s: Researcher: Completes res-002, requests approval
-T+61s: Discord: "@Admin - Ergonomic chair research complete [Approve/Reject]"
-T+65s: Admin: Approves
-T+66s: Database: res-002 status → approved, art-123 completedCount → 2/5
-
-... (process continues for res-003, res-004, res-005) ...
-
-// PHASE 3: ARTICLE WRITING - Once all research approved
-T+5m:  Database: All 5 research jobs approved (art-123 completedCount → 5/5)
-T+5m:  Writer (polling): Detects all research complete for art-123
-T+5m:  Writer: Updates art-123 status → writing
-T+6m:  Writer: Generates full article using AI + all 5 research findings
-T+7m:  Writer: Saves draft, updates art-123 status → awaiting_approval
-T+7m:  Discord: "@Admin - Article draft ready [Approve/Reject/Edit]"
-       Shows: Full article with all 5 products + affiliate links
-T+10m: Admin: Approves
-T+10m: Writer: Updates art-123 status → published
-T+10m: Writer: Publishes article
-T+10m: Discord: "🎉 Article published successfully!"
-```
-
-**Key Points:**
-- Initial discovery is **synchronous** (fast decision making)
-- Parallel research is **asynchronous** via database queue (resumable, trackable)
-- Writer polls database, not blocked during parallel research
-- Admin approves each research job independently as they complete
-- Final article generation happens only when ALL research approved
-
----
-
-## 💡 Key Benefits
-
-1. **Hybrid Flexibility:** Fast synchronous calls for decisions, async queue for parallel work
-2. **Parallel Processing:** Multiple research jobs can run simultaneously  
-3. **Resumable:** If bot crashes, queued jobs persist in database
-4. **Trackable:** Clear status for every job
-5. **Flexible:** Easy to add new job types
-6. **Scalable:** Can add more researcher instances
-7. **Auditable:** Full history of all jobs
-8. **Better UX:** Users see initial results fast, then parallel work happens in background
-
----
-
-## 🤔 When to Use Sync vs Async
-
-### Use **Synchronous** (Direct Call) When:
-- ✅ Need immediate result to make next decision (e.g., "what categories should I research?")
-- ✅ Single sequential research task
-- ✅ Writer needs to wait anyway before proceeding
-- ✅ Fast operation (<30 seconds expected)
-- ✅ Planning/discovery phase
-
-**Example:** Writer needs categories before knowing what products to research
-
-### Use **Asynchronous** (Queue) When:
-- ✅ Multiple independent tasks that can run in parallel
-- ✅ Long-running research (>1 minute)
-- ✅ Want system to be resumable if crash occurs
-- ✅ Don't need results immediately
-- ✅ Want to track progress independently per task
-
-**Example:** Researching 5 different products simultaneously
-
-### The Pattern:
-```
-Sync: Planning/Discovery (What do I need to do?)
-  ↓
-Async: Parallel Execution (Do all the things!)
-  ↓
-Sync: Final Assembly (Put it all together)
-```
-
----
-
-## 🔮 Future Enhancements
-
-- **Job Prioritization:** VIP articles get higher priority
-- **Scheduled Jobs:** "Research this every Monday"
-- **Job Dependencies:** "Don't start Job B until Job A completes"
-- **Batch Processing:** Process multiple low-priority jobs together
-- **Analytics:** Track average research time, success rates
-- **Web Dashboard:** View all jobs in browser UI
-
----
-
-This architecture will let you build sophisticated multi-product articles while keeping the system manageable and scalable! 🚀
+| Variable | Required | Description |
+|---|---|---|
+| `DISCORD_BOT_TOKEN` | Yes | Bot token from Discord Developer Portal |
+| `DISCORD_CLIENT_ID` | Yes | Application ID |
+| `DISCORD_GUILD_ID` | Yes | Server ID |
+| `DISCORD_RESEARCHER_CHANNEL_ID` | Yes | `#content-researcher` channel ID |
+| `DISCORD_WRITER_CHANNEL_ID` | Yes | `#writer-editor` channel ID |
+| `DISCORD_ADMIN_USER_ID` | Yes | Your Discord user ID (receives approval pings) |
+| `GEMINI_API_KEY` | Yes | Google Gemini API key |
+| `ANTHROPIC_API_KEY` | No | Claude API key (optional, swap via `config.ai.provider`) |
+| `TAVILY_API_KEY` | Yes | Tavily search API key |
+| `CHROMADB_URL` | No | ChromaDB URL (default: `http://localhost:8000`) |
+| `AMAZON_AFFILIATE_TAG` | No | Amazon Associates tag appended to product links |
+| `NODE_ENV` | No | `development` / `production` / `test` |
+| `LOG_LEVEL` | No | `error` / `warn` / `info` / `debug` |

@@ -5,9 +5,13 @@ import { aiService } from '../../services/ai.service';
 import { searchService, SearchResult } from '../../services/search.service';
 import { chromaService } from '../../services/chroma.service';
 import { databaseService } from '../../services/database.service';
+import { jobQueueService } from '../../services/jobQueue.service';
 import { SYSTEM_PROMPT, analyzeProsConsPrompt, competitorPrompt, summaryPrompt } from './context';
 import { ResearchFindings, Product, ApprovalRequest, Source } from '../../types';
+import { QueueResearchJob } from '../../types/jobs';
 import config from '../../config/env';
+
+const QUEUE_POLL_INTERVAL_MS = 5_000;
 
 const HIGH_CREDIBILITY_DOMAINS = [
   'amazon.com',
@@ -23,6 +27,7 @@ const HIGH_CREDIBILITY_DOMAINS = [
 
 export class ContentResearcher {
   private isRunning = false;
+  private queuePollTimer: NodeJS.Timeout | null = null;
 
   constructor() {
     logger.info('ContentResearcher agent initialized');
@@ -30,12 +35,103 @@ export class ContentResearcher {
 
   async start(): Promise<void> {
     this.isRunning = true;
-    logger.info('ContentResearcher agent started');
+    this.scheduleQueuePoll();
+    logger.info('ContentResearcher agent started — polling queue every 5s');
   }
 
   async stop(): Promise<void> {
     this.isRunning = false;
+    if (this.queuePollTimer) {
+      clearTimeout(this.queuePollTimer);
+      this.queuePollTimer = null;
+    }
     logger.info('ContentResearcher agent stopped');
+  }
+
+  // ── Queue polling ──────────────────────────────────────────────────────────
+
+  private scheduleQueuePoll(): void {
+    if (!this.isRunning) return;
+    this.queuePollTimer = setTimeout(async () => {
+      await this.pollQueueOnce();
+      this.scheduleQueuePoll();
+    }, QUEUE_POLL_INTERVAL_MS);
+  }
+
+  private async pollQueueOnce(): Promise<void> {
+    try {
+      // Recover any jobs that got stuck in_progress (e.g. from a previous crash)
+      const recovered = databaseService.recoverStaleInProgressJobs(30);
+      if (recovered > 0) {
+        logger.warn(`Recovered ${recovered} stale in_progress job(s) — re-queued for retry`);
+      }
+
+      const job = jobQueueService.dequeueNext();
+      if (!job) return;
+      logger.info(`Queue: picked up job ${job.id} — "${job.query}"`);
+      await this.processQueueJob(job);
+    } catch (error) {
+      logger.error('ContentResearcher queue poll error:', error);
+    }
+  }
+
+  private async processQueueJob(job: QueueResearchJob): Promise<void> {
+    try {
+      // Reuse the existing research pipeline — it handles approval internally
+      const findings = await this.researchProduct(job.query);
+
+      if (findings) {
+        // Approved
+        databaseService.updateQueueResearchJob(job.id, {
+          status: 'approved',
+          findings: JSON.stringify(findings),
+          completedAt: new Date().toISOString(),
+        });
+
+        if (job.parentJobId) {
+          databaseService.incrementArticleResearchCount(job.parentJobId);
+          logger.info(`Article ${job.parentJobId}: incremented completed research count`);
+        }
+      } else {
+        // Rejected, duplicate, or failed
+        const currentJob = databaseService.getQueueResearchJobById(job.id);
+        const retryCount = currentJob?.retryCount ?? job.retryCount;
+        const maxRetries = currentJob?.maxRetries ?? job.maxRetries;
+
+        if (retryCount < maxRetries) {
+          databaseService.updateQueueResearchJob(job.id, {
+            status: 'pending',
+            retryCount: retryCount + 1,
+          });
+          logger.info(`Queue job ${job.id} re-queued (retry ${retryCount + 1}/${maxRetries})`);
+        } else {
+          databaseService.updateQueueResearchJob(job.id, {
+            status: 'rejected',
+            completedAt: new Date().toISOString(),
+          });
+          logger.warn(`Queue job ${job.id} permanently rejected after ${maxRetries} retries`);
+        }
+      }
+    } catch (error) {
+      logger.error(`Queue job ${job.id} failed:`, error);
+      const currentJob = databaseService.getQueueResearchJobById(job.id);
+      const retryCount = currentJob?.retryCount ?? job.retryCount;
+      const maxRetries = currentJob?.maxRetries ?? job.maxRetries;
+
+      if (retryCount < maxRetries) {
+        databaseService.updateQueueResearchJob(job.id, {
+          status: 'pending',
+          retryCount: retryCount + 1,
+          failureReason: (error as Error).message,
+        });
+      } else {
+        databaseService.updateQueueResearchJob(job.id, {
+          status: 'failed',
+          failureReason: (error as Error).message,
+          completedAt: new Date().toISOString(),
+        });
+      }
+    }
   }
 
   async researchProduct(productQuery: string): Promise<ResearchFindings | null> {
@@ -46,15 +142,15 @@ export class ContentResearcher {
       // 1. Build initial product record from the query
       const product = this.buildProduct(productQuery);
 
-      // 2. ChromaDB dedup check — skip if very similar research already exists
-      const isDuplicate = await chromaService.hasSimilarResearch(
+      // 2. ChromaDB cache check — recycle existing findings if similar research already exists
+      const cachedFindings = await chromaService.getSimilarResearch(
         product.name,
         product.category,
         productQuery
       );
-      if (isDuplicate) {
-        logger.info(`Skipping "${productQuery}" — similar research already stored`);
-        return null;
+      if (cachedFindings) {
+        logger.info(`Recycling cached research for "${productQuery}" — skipping full pipeline`);
+        return cachedFindings;
       }
 
       // 3. Persist initial records to SQLite
@@ -287,7 +383,7 @@ export class ContentResearcher {
     };
 
     try {
-      const result = await discordService.requestApproval(request);
+      const result = await discordService.requestApproval(request, config.discord.researcherChannelId);
       return { approved: result.approved, feedback: result.feedback };
     } catch (error) {
       logger.error('Discord approval request failed:', error);
