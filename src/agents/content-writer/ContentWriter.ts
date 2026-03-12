@@ -17,6 +17,7 @@ import { ArticleRequest, ResearchFindings, ApprovalRequest } from '../../types';
 import { ArticleJob, QueueResearchJob } from '../../types/jobs';
 import { AIServiceError, AIErrorType, RateLimitType } from '../../types/ai.types';
 import ContentResearcher from '../content-researcher/ContentResearcher';
+import SeoOptimizer from '../seo-optimizer/SeoOptimizer';
 import config from '../../config/env';
 
 const OUTPUT_DIR = path.join(process.cwd(), 'output', 'articles');
@@ -26,7 +27,10 @@ export class ContentWriter {
   private isRunning = false;
   private pollTimer: NodeJS.Timeout | null = null;
 
-  constructor(private readonly contentResearcher: ContentResearcher) {
+  constructor(
+    private readonly contentResearcher: ContentResearcher,
+    private readonly seoOptimizer: SeoOptimizer
+  ) {
     logger.info('ContentWriter agent initialized');
   }
 
@@ -282,8 +286,20 @@ export class ContentWriter {
       );
 
       if (approved) {
-        logger.info(`Article ${article.id} approved — publishing`);
-        await this.publishArticle(article, fullDraft);
+        databaseService.updateArticleJob(article.id, { status: 'approved' });
+        logger.info(`Article ${article.id} approved — running SEO optimization`);
+        await this.notifyArticle(article, `🔍 **SEO optimization in progress…**`);
+
+        let publishContent = fullDraft;
+        try {
+          const seoResult = await this.seoOptimizer.run(article.id);
+          publishContent = seoResult.optimizedMarkdown;
+        } catch (seoError) {
+          logger.error(`SEO optimization failed for article ${article.id} — publishing unoptimized draft`, seoError);
+          await this.notifyArticle(article, `⚠️ SEO optimization failed — publishing original draft.\n${(seoError as Error).message}`);
+        }
+
+        await this.publishArticle(article, publishContent);
       } else {
         databaseService.updateArticleJob(article.id, { status: 'rejected' });
         logger.info(`Article ${article.id} rejected${feedback ? ` — feedback: ${feedback}` : ''}`);

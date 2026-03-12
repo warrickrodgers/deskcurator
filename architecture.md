@@ -1,7 +1,7 @@
 # DeskCurator — Architecture
 
-**Status:** Phase 3 complete (ContentWriter agent operational)
-**Last Updated:** February 2026
+**Status:** Phase 3 complete (ContentWriter agent operational with quality gates and error resilience)
+**Last Updated:** March 2026
 
 ---
 
@@ -13,33 +13,38 @@ DeskCurator is a two-agent Discord bot for generating affiliate content about de
 Admin
   │
   ├── #content-researcher ──► ContentResearcher Agent
-  │                               │ Tavily search
-  │                               │ Gemini AI analysis
+  │                               │ Pre-flight product validation
+  │                               │ Tavily search (3 parallel)
+  │                               │ Gemini Flash Lite analysis
   │                               │ ChromaDB dedup
+  │                               │ Confidence scoring (75% threshold)
   │                               │ SQLite persistence
   │
   └── #writer-editor ────────► ContentWriter Agent
           (threads per article)       │ Hybrid sync/async workflow
                                       │ Reads from SQLite queue
-                                      │ Generates articles via AI
+                                      │ Gemini Flash article generation
 ```
 
 ---
 
 ## Discord Channel Architecture
 
-Two dedicated channels enforce strict separation of concerns:
+Three dedicated channels enforce strict separation of concerns:
 
 | Channel | Agent | Commands | Notifications |
 |---|---|---|---|
-| `#content-researcher` | ContentResearcher | `!research <product>` | Research approval embeds, skip/reject notices |
-| `#writer-editor` | ContentWriter | `!write "<title>"`, `!status`, `!cancel <jobId>` | Article threads, startup message |
+| `#content-researcher` | ContentResearcher | `!research <product>` | Research approval embeds, validation skip/reject notices, confidence rejection alerts |
+| `#writer-editor` | ContentWriter | `!write "<title>"`, `!status`, `!cancel <jobId>`, `!retry-write <articleId>`, `!seo-report <articleId>` | Article threads, startup message |
+| `#seo-optimizer` | SeoOptimizer | — | SEO audit reports (score, keyword, checks, competitor gaps) posted automatically after each article is approved |
+
+**Env var:** `DISCORD_SEO_OPTIMIZER_CHANNEL_ID` → `config.discord.seoChannelId`
 
 ### Article Threads
 
 When `!write` is issued, ContentWriter creates a **public Discord thread** inside `#writer-editor` named after the article title. All article-level events post into that thread:
 
-- Phase 1 complete / categories identified
+- Phase 1 complete / products identified
 - Parallel research jobs queued
 - Writing in progress
 - Draft approval embed (Approve / Reject / Request Edit)
@@ -61,14 +66,20 @@ Runs two modes concurrently:
 2. **Queue polling** — polls `queue_research_jobs` every 5 seconds for pending writer-created jobs.
 
 ```
-researchProduct(query)
+researchProduct(query, { skipValidation? })
   │
   ├─ ChromaDB dedup check (0.85 cosine similarity threshold)
+  │
+  ├─ [unless skipValidation] Pre-flight product validation (Gemini)
+  │    → invalid topic: notify #content-researcher, return null
+  │
   ├─ Tavily: 3 parallel searches (info, reviews, competitors)
-  ├─ Gemini: pros/cons analysis (JSON)
-  ├─ Gemini: competitor analysis (JSON)
-  ├─ Gemini: affiliate summary
+  ├─ Gemini Flash Lite: pros/cons analysis (JSON)
+  ├─ Gemini Flash Lite: competitor analysis (JSON)
+  ├─ Gemini Flash Lite: affiliate summary
   ├─ Confidence scoring
+  │    → < 75%: auto-reject, notify #content-researcher, return null
+  │
   ├─ Store in ChromaDB
   ├─ Persist to SQLite (products + research_jobs)
   └─ Discord approval in #content-researcher
@@ -76,7 +87,19 @@ researchProduct(query)
        → rejected: return null
 ```
 
-Queue job processing re-uses `researchProduct()` and then updates the `queue_research_jobs` row + increments the parent article's `completedResearchCount`.
+**AI Model:** `gemini-3.1-flash-lite-preview` — lightweight model optimised for structured JSON extraction.
+
+Queue job processing re-uses `researchProduct()` and then updates the `queue_research_jobs` row + increments the parent article's `completedResearchCount`. RPD rate limit errors reschedule the job until after midnight without consuming a retry.
+
+#### Product Validation
+
+Before any expensive searches run, a Gemini call checks whether the topic is a real purchasable product (brand + model). Topics that are features, mechanisms, buying strategies, or generic categories are rejected immediately. Discovery queries from ContentWriter pass `skipValidation: true` to bypass this check — article titles aren't product names.
+
+#### Confidence Scoring
+
+Scores are calculated from: high-credibility source count, number of pros/cons extracted, total source count, and average Tavily relevance score. Research scoring below **75%** is automatically rejected and never sent for Discord approval.
+
+---
 
 ### ContentWriter
 
@@ -89,29 +112,34 @@ createArticle(request)          ← triggered by !write
   │
   ├─ Create Discord thread in #writer-editor
   │
-  ├─ [SYNC] Call contentResearcher.researchProduct(discoveryQuery)
-  │    → approval in #content-researcher
-  │    → extract categories from findings via AI
+  ├─ [SYNC] Build discovery query (product-focused, skipValidation: true)
+  │    → contentResearcher.researchProduct(discoveryQuery, { skipValidation: true })
+  │    → extract 3–5 specific named products via AI (categoryDiscovery / categoryExtraction)
   │
   ├─ INSERT article_job (status: pending_research)
-  ├─ INSERT N × queue_research_jobs (status: pending, priority: 7)
+  ├─ INSERT 3–5 × queue_research_jobs (status: pending, priority: 7)
   └─ Notify thread: "Queued N research jobs"
 
 pollForCompletedResearch()      ← runs every 10s
   │
-  └─ For each pending_research article:
+  └─ For each pending_research article where scheduled_after has passed:
        Check all linked queue_research_jobs
        All approved? → writeArticle()
        All done but some failed? → writeArticle() with approved subset
 
 writeArticle(article, jobs)
   │
-  ├─ Gemini: articleGenerationPrompt → markdown draft
-  ├─ Gemini: seoMetaPrompt → meta description
+  ├─ Gemini Flash: articleGenerationPrompt → structured buyer's guide markdown
+  ├─ Gemini Flash: seoMetaPrompt → meta description
   ├─ Update article_job (status: awaiting_approval, draftContent)
   ├─ Discord approval in article thread
   │    → approved: publishArticle()
   └─   → rejected: update status, post feedback to thread
+
+retryWrite(articleId)           ← triggered by !retry-write <articleId>
+  ├─ Lookup article_job from database
+  ├─ Find all approved queue_research_jobs for this article
+  └─ Call writeArticle() directly with existing research
 
 publishArticle()
   ├─ Write output/articles/<id>.md
@@ -119,14 +147,54 @@ publishArticle()
   └─ Notify thread: "Article published!"
 ```
 
+**AI Model:** `gemini-3-flash-preview` — more capable model used for full article generation.
+
+#### Discovery Query Logic
+
+`buildDiscoveryQuery` produces product-focused prompts without accessories:
+- **Broad articles** (multi_product, roundup): returns a range across categories
+- **Focused articles** (single_product, comparison): keeps results within one product type
+
+Product count is flexible: prompts ask for **3 to N** products (where N is at most 5), returning fewer if quality products are scarce.
+
+#### Article Generation (Buyer's Guide Format)
+
+Articles follow a structured buyer's guide format:
+1. Problem-driven introduction (no generic openers)
+2. Comparison table derived from research data
+3. Product sections (format varies by article type)
+4. Buying considerations based on research patterns
+5. Verdict with use-case recommendations
+6. FAQ with research-backed answers
+
+Banned phrases: "premium quality", "great for productivity", "perfect for any workspace", "industry-leading", "game-changer", "best in class"
+
+---
+
+## Error Handling & Rate Limit Strategy
+
+**File:** [src/services/gemini.provider.ts](src/services/gemini.provider.ts), [src/utils/retry.ts](src/utils/retry.ts), [src/services/ai.service.ts](src/services/ai.service.ts)
+
+Three error classes with distinct handling:
+
+| Error | Classification | Handling |
+|---|---|---|
+| 503 Service Unavailable | `SERVICE_UNAVAILABLE` | 30-min pause, then retry (up to maxRetries) |
+| 429 TPM (tokens/minute) | `RATE_LIMIT / TPM` | Exponential backoff (1s → 2s → 4s…) |
+| 429 RPD (requests/day) | `RATE_LIMIT / RPD` | No retry — throw immediately, job sets `scheduled_after` to midnight |
+
+RPD detection uses response keywords ("per_day", "DAILY") or retry delay > 1 hour. When RPD is hit in a queue job, the job's `scheduled_after` column is set to the next day and the job stays `pending` — no retry count consumed.
+
 ---
 
 ## Database Schema (SQLite)
 
 **File:** [src/services/database.service.ts](src/services/database.service.ts)
 
+Schema uses additive migrations — safe to run against existing databases.
+
 ### `products`
-Tracks product metadata created during `!research` flows.
+Tracks product metadata created during research flows.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -139,7 +207,7 @@ Tracks product metadata created during `!research` flows.
 | created_at | TEXT | datetime |
 
 ### `research_jobs`
-Tracks legacy `!research` job runs (tied to a product).
+Tracks `!research` job runs (tied to a product).
 
 | Column | Type | Notes |
 |---|---|---|
@@ -173,14 +241,16 @@ Writer-created research jobs processed by ContentResearcher's polling loop.
 | type | TEXT | product / category / comparison |
 | status | TEXT | pending / in_progress / awaiting_approval / approved / rejected / failed |
 | priority | INTEGER | 1–10, higher = sooner |
-| query | TEXT | e.g. "Best standing desk for WFH Setup" |
+| query | TEXT | e.g. "Herman Miller Aeron review and specifications" |
 | requested_by | TEXT | writer / user |
 | parent_job_id | TEXT | → article_jobs.id |
 | findings | TEXT | JSON-serialized ResearchFindings |
 | discord_message_id | TEXT | |
+| discord_thread_id | TEXT | |
 | created_at / started_at / completed_at | TEXT | |
 | failure_reason | TEXT | |
 | retry_count / max_retries | INTEGER | default 0 / 3 |
+| scheduled_after | TEXT | ISO timestamp — job not eligible until this time passes (used for RPD pausing) |
 
 ### `article_jobs`
 Tracks full article lifecycle from queue to publish.
@@ -189,7 +259,7 @@ Tracks full article lifecycle from queue to publish.
 |---|---|---|
 | id | TEXT PK | UUID |
 | status | TEXT | pending_research / writing / awaiting_approval / approved / rejected / published / failed |
-| title | TEXT | e.g. "5 Best Desk Items For Your WFH Setup" |
+| title | TEXT | e.g. "Best Standing Desks for Tall People" |
 | article_type | TEXT | single_product / multi_product / comparison / roundup |
 | research_job_ids | TEXT | JSON array of queue_research_job IDs |
 | required_research_count | INTEGER | |
@@ -200,6 +270,7 @@ Tracks full article lifecycle from queue to publish.
 | discord_thread_id | TEXT | writer-editor thread for this article |
 | published_url | TEXT | future CMS URL |
 | created_at / completed_at / published_at | TEXT | |
+| scheduled_after | TEXT | ISO timestamp — holds article polling until time passes (used for RPD pausing) |
 
 ---
 
@@ -208,14 +279,19 @@ Tracks full article lifecycle from queue to publish.
 ### AI Service
 **File:** [src/services/ai.service.ts](src/services/ai.service.ts)
 
-Provider abstraction over Gemini and Anthropic. Features:
+Provider abstraction over Gemini and Anthropic. Two instances are exported:
+
+| Export | Model | Used by |
+|---|---|---|
+| `aiService` | `gemini-3.1-flash-lite-preview` | ContentResearcher — structured JSON extraction |
+| `writerAiService` | `gemini-3-flash-preview` | ContentWriter — full article generation |
+
+Features:
 - Swappable provider via `config.ai.provider`
-- Token bucket rate limiting per provider
-- Exponential backoff retry (up to `maxRetries`)
+- Exponential backoff retry (up to `maxRetries`) — RPD errors bypass retry and throw immediately
 - Token usage tracking
 - `ask(prompt, systemPrompt?)` — single-turn helper used by all agents
-
-**Active provider:** Gemini `gemini-2.5-flash`
+- `notifyRateLimit(waitMs, attempt, error?)` — contextual Discord notifications for 503 / TPM / RPD
 
 ### ChromaDB Service
 **File:** [src/services/chroma.service.ts](src/services/chroma.service.ts)
@@ -223,7 +299,7 @@ Provider abstraction over Gemini and Anthropic. Features:
 Vector store for research deduplication.
 - Embeddings via `gemini-embedding-001`
 - Cosine similarity collection
-- `hasSimilarResearch(name, category, query)` — returns true if similarity ≥ 0.85
+- `getSimilarResearch(name, category, query)` — returns cached findings if similarity ≥ 0.85
 - `storeResearch(jobId, findings, query)` — stores after approval
 
 ### Search Service
@@ -238,24 +314,24 @@ Wraps the Tavily API. Runs three parallel searches per product:
 **File:** [src/services/discord.ts](src/services/discord.ts)
 
 Manages all Discord interactions:
-- **Channel routing** — `!research` only handled in researcher channel; `!write`/`!status`/`!cancel` only in writer channel
+- **Channel routing** — `!research` only handled in researcher channel; `!write`/`!status`/`!cancel`/`!retry-write` only in writer channel
 - **`sendNotification(message, channelId?)`** — sends to researcher channel by default; accepts explicit channel or thread ID
 - **`requestApproval(request, channelId?)`** — posts embed with Approve / Reject / Request Edit buttons; waits for interaction
 - **`createArticleThread(title)`** — creates a public thread in the writer channel; returns thread ID
-- **Handler registration** — `registerResearchHandler`, `registerWriteHandler`, `registerStatusHandler`, `registerCancelHandler`
+- **Handler registration** — `registerResearchHandler`, `registerWriteHandler`, `registerStatusHandler`, `registerCancelHandler`, `registerRetryWriteHandler`
 
 ### Job Queue Service
 **File:** [src/services/jobQueue.service.ts](src/services/jobQueue.service.ts)
 
 Thin wrapper over `databaseService` for queue semantics:
 - `enqueueResearch(params)` — creates a `queue_research_job` with defaults
-- `dequeueNext()` — atomically fetches the highest-priority pending job and marks it `in_progress`
+- `dequeueNext()` — atomically fetches the highest-priority pending job where `scheduled_after` has passed, marks it `in_progress`
 - `createArticle(params)` — creates an `article_job`
 
 ### Database Service
 **File:** [src/services/database.service.ts](src/services/database.service.ts)
 
-SQLite via `better-sqlite3`. WAL mode, foreign keys enabled. All SELECT queries use explicit column aliases for snake_case → camelCase mapping. Additive migrations run on startup (safe on existing databases).
+SQLite via `better-sqlite3`. WAL mode, foreign keys enabled. All SELECT queries use explicit column aliases for snake_case → camelCase mapping. Additive migrations run on startup (safe on existing databases). Both `queue_research_jobs` and `article_jobs` have a `scheduled_after` column added via migration to support RPD pausing.
 
 ---
 
@@ -266,6 +342,7 @@ SQLite via `better-sqlite3`. WAL mode, foreign keys enabled. All SELECT queries 
 
 | Prompt | Purpose |
 |---|---|
+| `validateProductPrompt` | Pre-flight check: is this a real purchasable product with brand + model? |
 | `analyzeProsConsPrompt` | Extract structured pros/cons JSON from search results |
 | `competitorPrompt` | Identify top 3–5 competitors with differentiators |
 | `summaryPrompt` | Write affiliate-optimised 3–4 paragraph summary |
@@ -275,9 +352,9 @@ SQLite via `better-sqlite3`. WAL mode, foreign keys enabled. All SELECT queries 
 
 | Prompt | Purpose |
 |---|---|
-| `categoryDiscoveryPrompt` | Generate N product category names for an article title |
-| `categoryExtractionPrompt` | Parse N categories from an existing research summary |
-| `articleGenerationPrompt` | Write full markdown article (supports all 4 article types) |
+| `categoryDiscoveryPrompt` | Generate 3–N specific named products (brand + model) for an article title |
+| `categoryExtractionPrompt` | Parse 3–N named products from an existing research summary |
+| `articleGenerationPrompt` | Write structured buyer's guide (intro, table, products, considerations, verdict, FAQ) |
 | `seoMetaPrompt` | Write a 150–160 char SEO meta description |
 
 ---
@@ -285,42 +362,50 @@ SQLite via `better-sqlite3`. WAL mode, foreign keys enabled. All SELECT queries 
 ## End-to-End Example
 
 ```
-T+0s   Admin: !write "5 Best Desk Items For Your WFH Setup"
-T+1s   Bot creates Discord thread: "5 Best Desk Items For Your WFH Setup"
+T+0s   Admin: !write "Best Standing Desks for Tall People"
+T+1s   Bot creates Discord thread: "Best Standing Desks for Tall People"
 T+2s   Thread: "Phase 1: running initial discovery…"
-T+2s   ContentResearcher: researches "top 5 WFH desk product categories"
-T+12s  #content-researcher: approval embed for category research
+T+2s   ContentResearcher: researches "Best products for: Best Standing Desks for Tall People"
+           (skipValidation: true — title is not a product name)
+T+12s  #content-researcher: approval embed for discovery research
 T+15s  Admin: Approve
-T+16s  Thread: "Phase 1 complete — 5 categories found:
-               1. Standing Desk  2. Ergonomic Chair  3. Monitor Arm
-               4. Desk Lamp  5. Keyboard Tray
-               Queued 5 research jobs"
+T+16s  Thread: "Phase 1 complete — 4 products found:
+               Uplift V2 Commercial, FlexiSpot E7 Pro, Jarvis Bamboo, Autonomous SmartDesk Pro
+               Queued 4 research jobs"
 
-T+17s  queue_research_jobs: 5 rows inserted (status: pending)
+T+17s  queue_research_jobs: 4 rows inserted (status: pending)
 
 ── ContentResearcher polls every 5s ──────────────────────────────────────────
 
-T+20s  Picks up job: "Best standing desk for WFH Setup"
-T+35s  #content-researcher: "Standing desk research" approval embed
-T+38s  Admin: Approve  →  job approved, article completedCount → 1/5
+T+20s  Picks up job: "Uplift V2 Commercial review and specifications"
+           Pre-flight validation: passes (brand + model present)
+T+35s  confidence: 88% — passes threshold
+T+35s  #content-researcher: approval embed
+T+38s  Admin: Approve  →  job approved, article completedCount → 1/4
 
-T+40s  Picks up job: "Best ergonomic chair for WFH Setup"
-T+55s  Admin: Approve  →  completedCount → 2/5
+T+40s  Picks up job: "FlexiSpot E7 Pro review and specifications"
+T+55s  Admin: Approve  →  completedCount → 2/4
 
-       … (repeat for monitor arm, desk lamp, keyboard tray) …
+       … (repeat for Jarvis Bamboo, Autonomous SmartDesk Pro) …
 
-T+4m   All 5 jobs approved, completedCount → 5/5
+T+3m   All 4 jobs approved, completedCount → 4/4
 
 ── ContentWriter polls every 10s ─────────────────────────────────────────────
 
-T+4m   Detects all research complete for article
-T+4m   Thread: "Writing article… generating draft now…"
-T+5m   Gemini generates full markdown article + SEO meta
-T+5m   article_jobs: status → awaiting_approval
-T+5m   Thread: approval embed with article draft preview
-T+8m   Admin: Approve
-T+8m   output/articles/<id>.md written
-T+8m   Thread: "Article published! File: output/articles/<id>.md"
+T+3m   Detects all research complete for article
+T+3m   Thread: "Writing article… generating draft now…"
+T+4m   Gemini Flash generates full buyer's guide markdown + SEO meta
+T+4m   article_jobs: status → awaiting_approval
+T+4m   Thread: approval embed with article draft preview
+T+7m   Admin: Approve
+T+7m   output/articles/<id>.md written
+T+7m   Thread: "Article published! File: output/articles/<id>.md"
+
+── Manual retry example ──────────────────────────────────────────────────────
+
+       Admin: !retry-write abc123
+       Bot looks up article abc123, finds its approved research jobs
+       Calls writeArticle() directly — no new research needed
 ```
 
 ---

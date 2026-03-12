@@ -11,6 +11,8 @@ export type ArticleJobStatus =
   | 'writing'
   | 'awaiting_approval'
   | 'approved'
+  | 'seo_optimizing'
+  | 'seo_completed'
   | 'rejected'
   | 'published'
   | 'failed';
@@ -51,6 +53,8 @@ export interface ArticleJob {
   completedResearchCount: number;
   draftContent?: string;
   finalContent?: string;
+  /** JSON-serialized SeoAuditReport — set after SEO optimization completes. */
+  seoReport?: string;
   discordMessageId?: string;
   discordThreadId?: string;
   publishedUrl?: string;
