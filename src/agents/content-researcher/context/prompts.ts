@@ -3,6 +3,32 @@
  * All JSON-returning prompts strip markdown fences in the caller before parsing.
  */
 
+/**
+ * Pre-flight check: determines whether a research topic is a real purchasable
+ * product (has a brand + model name) or is a feature, concept, or category.
+ * Used to abort the pipeline early and avoid wasting search credits.
+ */
+export function validateProductPrompt(topic: string): string {
+  return `You are validating whether a research topic is a specific purchasable product.
+
+Topic: "${topic}"
+
+A VALID product must have:
+- A real brand name (e.g. Herman Miller, FlexiSpot, Uplift, Steelcase, Secretlab, Logitech)
+- A specific model name or product line (e.g. Aeron, E7, V2 Commercial, Leap V2)
+
+An INVALID topic is any of:
+- A feature or mechanism (e.g. "3D armrest systems", "synchronous tilt", "lumbar support")
+- A buying strategy (e.g. "refurbished chairs", "budget standing desks")
+- A product category without a specific model (e.g. "ergonomic chairs", "monitor arms")
+- A concept or component (e.g. "mesh backrests", "gas lift cylinders")
+
+Respond with ONLY this JSON object, no other text:
+{"valid": true, "brand": "Brand Name", "model": "Model Name"}
+or:
+{"valid": false, "reason": "One sentence explaining why this is not a product"}`;
+}
+
 export function analyzeProsConsPrompt(productName: string, searchContent: string): string {
   return `Analyze the following search results about "${productName}" and extract a balanced list of pros and cons.
 

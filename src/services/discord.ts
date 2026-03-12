@@ -22,6 +22,7 @@ type ResearchCommandHandler = (productQuery: string) => Promise<void>;
 type WriteCommandHandler = (title: string) => Promise<void>;
 type StatusCommandHandler = () => Promise<void>;
 type CancelCommandHandler = (jobId: string) => Promise<void>;
+type RetryWriteCommandHandler = (articleId: string) => Promise<void>;
 
 type SendableChannel = TextChannel | NewsChannel | ThreadChannel;
 
@@ -41,6 +42,7 @@ export class DiscordService {
   private writeHandler: WriteCommandHandler | null = null;
   private statusHandler: StatusCommandHandler | null = null;
   private cancelHandler: CancelCommandHandler | null = null;
+  private retryWriteHandler: RetryWriteCommandHandler | null = null;
 
   constructor() {
     this.client = new Client({
@@ -138,6 +140,24 @@ export class DiscordService {
           this.cancelHandler(jobId).catch(async (err) => {
             logger.error('Cancel command failed:', err);
             await message.reply(`Cancel failed: ${err.message}`).catch(() => {});
+          });
+          return;
+        }
+
+        if (content.startsWith('!retry-write ')) {
+          const articleId = content.slice('!retry-write '.length).trim();
+          if (!articleId) {
+            await message.reply('Usage: `!retry-write <articleId>`');
+            return;
+          }
+          if (!this.retryWriteHandler) {
+            await message.reply('ContentWriter agent not initialized yet.');
+            return;
+          }
+          await message.reply(`🔄 Retrying write for article \`${articleId}\`...`);
+          this.retryWriteHandler(articleId).catch(async (err) => {
+            logger.error('Retry-write command failed:', err);
+            await message.reply(`Retry failed: ${err.message}`).catch(() => {});
           });
           return;
         }
@@ -389,6 +409,11 @@ export class DiscordService {
   registerCancelHandler(handler: CancelCommandHandler): void {
     this.cancelHandler = handler;
     logger.info('Cancel command handler registered (!cancel <jobId>)');
+  }
+
+  registerRetryWriteHandler(handler: RetryWriteCommandHandler): void {
+    this.retryWriteHandler = handler;
+    logger.info('Retry-write command handler registered (!retry-write <articleId>)');
   }
 
   getClient(): Client {

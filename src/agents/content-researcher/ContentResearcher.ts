@@ -6,9 +6,10 @@ import { searchService, SearchResult } from '../../services/search.service';
 import { chromaService } from '../../services/chroma.service';
 import { databaseService } from '../../services/database.service';
 import { jobQueueService } from '../../services/jobQueue.service';
-import { SYSTEM_PROMPT, analyzeProsConsPrompt, competitorPrompt, summaryPrompt } from './context';
+import { SYSTEM_PROMPT, validateProductPrompt, analyzeProsConsPrompt, competitorPrompt, summaryPrompt } from './context';
 import { ResearchFindings, Product, ApprovalRequest, Source } from '../../types';
 import { QueueResearchJob } from '../../types/jobs';
+import { AIServiceError, AIErrorType, RateLimitType } from '../../types/ai.types';
 import config from '../../config/env';
 
 const QUEUE_POLL_INTERVAL_MS = 5_000;
@@ -113,6 +114,22 @@ export class ContentResearcher {
         }
       }
     } catch (error) {
+      // RPD (daily quota) — reschedule for after midnight, don't burn a retry
+      if (
+        error instanceof AIServiceError &&
+        error.type === AIErrorType.RATE_LIMIT &&
+        error.rateLimitType === RateLimitType.RPD
+      ) {
+        const resumeAt = new Date(Date.now() + (error.retryAfter ?? 0));
+        databaseService.updateQueueResearchJob(job.id, {
+          status: 'pending',
+          scheduledAfter: resumeAt.toISOString(),
+          failureReason: `RPD limit — scheduled to resume at ${resumeAt.toUTCString()}`,
+        });
+        logger.warn(`Queue job ${job.id} paused until ${resumeAt.toUTCString()} (RPD limit)`);
+        return;
+      }
+
       logger.error(`Queue job ${job.id} failed:`, error);
       const currentJob = databaseService.getQueueResearchJobById(job.id);
       const retryCount = currentJob?.retryCount ?? job.retryCount;
@@ -134,7 +151,10 @@ export class ContentResearcher {
     }
   }
 
-  async researchProduct(productQuery: string): Promise<ResearchFindings | null> {
+  async researchProduct(
+    productQuery: string,
+    options: { skipValidation?: boolean } = {}
+  ): Promise<ResearchFindings | null> {
     const jobId = randomUUID();
     logger.info(`Research job ${jobId} started for: "${productQuery}"`);
 
@@ -153,7 +173,25 @@ export class ContentResearcher {
         return cachedFindings;
       }
 
-      // 3. Persist initial records to SQLite
+      // 3. Pre-flight: validate this topic is a real purchasable product.
+      //    Skipped for discovery queries (article titles / topic searches) — those are
+      //    search topics, not specific product names, so they would always fail validation.
+      if (!options.skipValidation) {
+        logger.info(`Validating "${productQuery}" is a purchasable product...`);
+        const validationRaw = await aiService.ask(validateProductPrompt(productQuery), SYSTEM_PROMPT);
+        const validation = this.parseValidationResponse(validationRaw);
+
+        if (!validation.valid) {
+          logger.warn(`Research aborted — "${productQuery}" is not a product: ${validation.reason}`);
+          await discordService.sendNotification(
+            `⛔ Research skipped: **"${productQuery}"** is not a purchasable product.\n> ${validation.reason}`,
+            config.discord.researcherChannelId
+          );
+          return null;
+        }
+      }
+
+      // 4. Persist initial records to SQLite
       databaseService.insertProduct({
         id: product.id,
         name: product.name,
@@ -227,6 +265,20 @@ export class ContentResearcher {
 
       // 8. Calculate confidence score
       const confidence = this.calculateConfidence(sources, pros, cons, infoResults);
+
+      // Reject low-confidence research before storing or requesting approval
+      const CONFIDENCE_THRESHOLD = 0.75;
+      if (confidence < CONFIDENCE_THRESHOLD) {
+        logger.warn(
+          `Research for "${productQuery}" rejected — confidence ${(confidence * 100).toFixed(0)}% is below threshold (${CONFIDENCE_THRESHOLD * 100}%)`
+        );
+        databaseService.updateResearchJobStatus(jobId, 'failed', confidence);
+        await discordService.sendNotification(
+          `⚠️ Research auto-rejected: **"${productQuery}"** scored **${(confidence * 100).toFixed(0)}%** confidence — below the 75% threshold.\nNot enough reliable sources found.`,
+          config.discord.researcherChannelId
+        );
+        return null;
+      }
 
       const findings: ResearchFindings = {
         product,
@@ -304,6 +356,21 @@ export class ContentResearcher {
         : 'low',
       dateAccessed: new Date(),
     };
+  }
+
+  private parseValidationResponse(raw: string): { valid: boolean; reason?: string; brand?: string; model?: string } {
+    try {
+      const cleaned = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      const parsed = JSON.parse(cleaned);
+      if (typeof parsed.valid === 'boolean') {
+        return parsed;
+      }
+      throw new Error('Unexpected JSON shape');
+    } catch {
+      // If parsing fails, assume valid to avoid false negatives blocking real products
+      logger.warn('Could not parse product validation response — assuming valid');
+      return { valid: true };
+    }
   }
 
   private parseProsConsResponse(

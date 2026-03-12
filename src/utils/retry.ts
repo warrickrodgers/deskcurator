@@ -4,7 +4,7 @@
  * retry-after delays when available.
  */
 
-import { AIServiceError, AIErrorType } from '../types/ai.types';
+import { AIServiceError, AIErrorType, RateLimitType } from '../types/ai.types';
 import logger from './logger';
 
 export interface RetryConfig {
@@ -26,7 +26,16 @@ export async function retryWithBackoff<T>(
     maxDelay = 60_000,
     shouldRetry = (error) => {
       if (error instanceof AIServiceError) {
-        return error.type === AIErrorType.RATE_LIMIT || error.type === AIErrorType.NETWORK_ERROR;
+        // RPD (daily quota): throw immediately so the job queue can schedule for midnight.
+        // Retrying here would just block the thread for hours.
+        if (error.type === AIErrorType.RATE_LIMIT && error.rateLimitType === RateLimitType.RPD) {
+          return false;
+        }
+        return (
+          error.type === AIErrorType.RATE_LIMIT ||
+          error.type === AIErrorType.NETWORK_ERROR ||
+          error.type === AIErrorType.SERVICE_UNAVAILABLE
+        );
       }
       return false;
     },

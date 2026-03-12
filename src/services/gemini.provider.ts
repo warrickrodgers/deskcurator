@@ -12,6 +12,7 @@ import {
   AIMessage,
   AIServiceError,
   AIErrorType,
+  RateLimitType,
   RateLimitStatus,
   StreamCallback,
   IAIProvider,
@@ -178,17 +179,60 @@ export class GeminiProvider implements IAIProvider {
     return undefined;
   }
 
+  /** Returns milliseconds until the next UTC midnight. */
+  private msUntilMidnight(): number {
+    const now = new Date();
+    const midnight = new Date(now);
+    midnight.setUTCHours(24, 0, 0, 0);
+    return midnight.getTime() - now.getTime();
+  }
+
+  /**
+   * Classifies a 429 error as TPM (tokens-per-minute) or RPD (requests-per-day).
+   * RPD indicators: quota metric contains "per_day", or the API-specified retryDelay > 1 hour.
+   */
+  private classifyRateLimit(message: string): { rateLimitType: RateLimitType; retryAfterMs?: number } {
+    const retryAfterMs = this.parseRetryAfterMs(message);
+
+    const isRpd =
+      message.includes('per_day') ||
+      message.includes('requests_per_day') ||
+      message.includes('DAILY') ||
+      // A retryDelay over 1 hour is a strong signal that this is a daily quota reset
+      (retryAfterMs !== undefined && retryAfterMs > 3_600_000);
+
+    if (isRpd) {
+      return { rateLimitType: RateLimitType.RPD, retryAfterMs: retryAfterMs ?? this.msUntilMidnight() };
+    }
+
+    return { rateLimitType: RateLimitType.TPM, retryAfterMs };
+  }
+
   private handleError(error: any): AIServiceError {
     const message = error.message || 'Unknown error occurred';
     const statusCode = error.status ?? error.statusCode;
 
-    if (statusCode === 429 || (statusCode !== 403 && (message.includes('rate limit') || message.includes('RESOURCE_EXHAUSTED')))) {
+    // 503 Service Unavailable — transient overload, retry after 30 minutes
+    if (statusCode === 503 || message.includes('Service Unavailable') || message.includes('503')) {
       return new AIServiceError(
-        `Rate limit exceeded: ${message}`,
+        `Service unavailable (high demand): ${message}`,
+        AIErrorType.SERVICE_UNAVAILABLE,
+        AIProvider.GEMINI,
+        503,
+        30 * 60 * 1000, // 30 minutes
+      );
+    }
+
+    if (statusCode === 429 || (statusCode !== 403 && (message.includes('rate limit') || message.includes('RESOURCE_EXHAUSTED')))) {
+      const { rateLimitType, retryAfterMs } = this.classifyRateLimit(message);
+      return new AIServiceError(
+        `Rate limit exceeded (${rateLimitType.toUpperCase()}): ${message}`,
         AIErrorType.RATE_LIMIT,
         AIProvider.GEMINI,
         429,
-        this.parseRetryAfterMs(message),
+        retryAfterMs,
+        undefined,
+        rateLimitType,
       );
     }
     if (statusCode === 403 || message.includes('quota') || message.includes('permission') || message.includes('not found') || message.includes('does not exist')) {

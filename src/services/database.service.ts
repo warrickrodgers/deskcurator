@@ -124,10 +124,13 @@ export class DatabaseService {
     `);
 
     // Additive migrations — safe to run on existing DBs
-    try {
-      this.conn.exec(`ALTER TABLE article_jobs ADD COLUMN discord_thread_id TEXT`);
-    } catch {
-      // Column already exists — no-op
+    const migrations = [
+      `ALTER TABLE article_jobs ADD COLUMN discord_thread_id TEXT`,
+      `ALTER TABLE queue_research_jobs ADD COLUMN scheduled_after TEXT`,
+      `ALTER TABLE article_jobs ADD COLUMN scheduled_after TEXT`,
+    ];
+    for (const sql of migrations) {
+      try { this.conn.exec(sql); } catch { /* column already exists */ }
     }
   }
 
@@ -248,6 +251,7 @@ export class DatabaseService {
       completedAt: string;
       failureReason: string;
       retryCount: number;
+      scheduledAfter: string;
     }>
   ): void {
     const setClauses: string[] = [];
@@ -260,6 +264,7 @@ export class DatabaseService {
     if (fields.completedAt !== undefined) { setClauses.push('completed_at = @completedAt'); params.completedAt = fields.completedAt; }
     if (fields.failureReason !== undefined) { setClauses.push('failure_reason = @failureReason'); params.failureReason = fields.failureReason; }
     if (fields.retryCount !== undefined) { setClauses.push('retry_count = @retryCount'); params.retryCount = fields.retryCount; }
+    if (fields.scheduledAfter !== undefined) { setClauses.push('scheduled_after = @scheduledAfter'); params.scheduledAfter = fields.scheduledAfter; }
 
     if (setClauses.length === 0) return;
     this.conn.prepare(`UPDATE queue_research_jobs SET ${setClauses.join(', ')} WHERE id = @id`).run(params);
@@ -276,7 +281,8 @@ export class DatabaseService {
     completed_at   AS completedAt,
     failure_reason AS failureReason,
     retry_count    AS retryCount,
-    max_retries    AS maxRetries
+    max_retries    AS maxRetries,
+    scheduled_after AS scheduledAfter
   `;
 
   getNextPendingResearchJob(): QueueResearchJob | undefined {
@@ -285,6 +291,7 @@ export class DatabaseService {
         `SELECT ${DatabaseService.QUEUE_JOB_COLS}
          FROM queue_research_jobs
          WHERE status = 'pending'
+           AND (scheduled_after IS NULL OR scheduled_after <= datetime('now'))
          ORDER BY priority DESC, created_at ASC
          LIMIT 1`
       )
@@ -375,6 +382,7 @@ export class DatabaseService {
       publishedUrl: string;
       completedAt: string;
       publishedAt: string;
+      scheduledAfter: string;
     }>
   ): void {
     const setClauses: string[] = [];
@@ -390,6 +398,7 @@ export class DatabaseService {
     if (fields.publishedUrl !== undefined) { setClauses.push('published_url = @publishedUrl'); params.publishedUrl = fields.publishedUrl; }
     if (fields.completedAt !== undefined) { setClauses.push('completed_at = @completedAt'); params.completedAt = fields.completedAt; }
     if (fields.publishedAt !== undefined) { setClauses.push('published_at = @publishedAt'); params.publishedAt = fields.publishedAt; }
+    if (fields.scheduledAfter !== undefined) { setClauses.push('scheduled_after = @scheduledAfter'); params.scheduledAfter = fields.scheduledAfter; }
 
     if (setClauses.length === 0) return;
     this.conn.prepare(`UPDATE article_jobs SET ${setClauses.join(', ')} WHERE id = @id`).run(params);
@@ -408,7 +417,8 @@ export class DatabaseService {
     published_url              AS publishedUrl,
     created_at                 AS createdAt,
     completed_at               AS completedAt,
-    published_at               AS publishedAt
+    published_at               AS publishedAt,
+    scheduled_after            AS scheduledAfter
   `;
 
   getArticleJobsByStatus(status: ArticleJobStatus): ArticleJob[] {
@@ -416,7 +426,8 @@ export class DatabaseService {
       .prepare(
         `SELECT ${DatabaseService.ARTICLE_JOB_COLS}
          FROM article_jobs
-         WHERE status = ?`
+         WHERE status = ?
+           AND (scheduled_after IS NULL OR scheduled_after <= datetime('now'))`
       )
       .all(status) as ArticleJob[];
   }
