@@ -3,7 +3,7 @@ import * as path from 'path';
 import { randomUUID } from 'crypto';
 import logger from '../../utils/logger';
 import discordService from '../../services/discord';
-import { aiService } from '../../services/ai.service';
+import { aiService, writerAiService } from '../../services/ai.service';
 import { databaseService } from '../../services/database.service';
 import { jobQueueService } from '../../services/jobQueue.service';
 import {
@@ -15,6 +15,7 @@ import {
 } from './context';
 import { ArticleRequest, ResearchFindings, ApprovalRequest } from '../../types';
 import { ArticleJob, QueueResearchJob } from '../../types/jobs';
+import { AIServiceError, AIErrorType, RateLimitType } from '../../types/ai.types';
 import ContentResearcher from '../content-researcher/ContentResearcher';
 import config from '../../config/env';
 
@@ -44,7 +45,35 @@ export class ContentWriter {
     logger.info('ContentWriter agent stopped');
   }
 
-  // ── Public entry point ────────────────────────────────────────────────────
+  // ── Public entry points ───────────────────────────────────────────────────
+
+  /**
+   * Manual retry triggered by !retry-write <articleId>.
+   *
+   * Skips research entirely — looks up existing approved research for the article
+   * and attempts to write it again. Useful after a 503 or RPD failure.
+   */
+  async retryWrite(articleId: string): Promise<void> {
+    const article = databaseService.getArticleJobById(articleId);
+    if (!article) throw new Error(`No article found with ID: ${articleId}`);
+
+    const ids: string[] = JSON.parse(article.researchJobIds ?? '[]');
+    if (ids.length === 0) {
+      throw new Error(`Article ${articleId} has no research jobs — run !write to start from scratch`);
+    }
+
+    const researchJobs = databaseService.getQueueResearchJobsByIds(ids);
+    const approved = researchJobs.filter((j) => j.status === 'approved');
+
+    if (approved.length === 0) {
+      throw new Error(
+        `No approved research for article ${articleId} (${researchJobs.length} jobs found, none approved)`
+      );
+    }
+
+    logger.info(`retryWrite: article ${articleId} — forcing write with ${approved.length}/${researchJobs.length} approved research jobs`);
+    await this.writeArticle(article, approved);
+  }
 
   /**
    * Hybrid workflow entry point triggered by !write "<title>".
@@ -53,6 +82,7 @@ export class ContentWriter {
    * Phase 2 (async): Queue N parallel product research jobs and return immediately.
    */
   async createArticle(request: ArticleRequest): Promise<void> {
+    // 5 is the upper bound — the discovery AI can return fewer if not enough products exist
     const productCount = request.productCount ?? 5;
     logger.info(`ContentWriter: starting article "${request.title}" (${productCount} products)`);
 
@@ -72,8 +102,9 @@ export class ContentWriter {
       logger.info('Phase 1: initial category discovery (synchronous)…');
       await notify(`🔍 **Phase 1:** Running initial category discovery for **"${request.title}"**…`);
 
-      const discoveryQuery = `Find the top ${productCount} most important product categories someone would need for: ${request.title}`;
-      const initialFindings = await this.contentResearcher.researchProduct(discoveryQuery);
+      const discoveryQuery = this.buildDiscoveryQuery(request.title, request.articleType);
+      // skipValidation: discovery is a topic search, not a specific product name
+      const initialFindings = await this.contentResearcher.researchProduct(discoveryQuery, { skipValidation: true });
 
       if (!initialFindings) {
         await notify(`❌ Aborted — initial research was rejected or skipped.`);
@@ -101,7 +132,7 @@ export class ContentWriter {
 
       const researchJobIds: string[] = categories.map((category) =>
         jobQueueService.enqueueResearch({
-          query: `Best ${category} for: ${request.title}`,
+          query: this.buildResearchQuery(category, request.title),
           type: 'product',
           parentJobId: articleId,
           priority: 7,
@@ -198,7 +229,7 @@ export class ContentWriter {
         throw new Error('No research findings available to write article');
       }
 
-      const draft = await aiService.ask(
+      const draft = await writerAiService.ask(
         articleGenerationPrompt(
           article.title,
           article.articleType,
@@ -208,7 +239,14 @@ export class ContentWriter {
         WRITER_SYSTEM_PROMPT
       );
 
-      const metaDescription = await aiService.ask(
+      logger.debug(`Article request submitted and the prompt was ${articleGenerationPrompt(
+          article.title,
+          article.articleType,
+          researchItems,
+          config.amazon.affiliateTag
+        )}`)
+
+      const metaDescription = await writerAiService.ask(
         seoMetaPrompt(article.title, draft),
         WRITER_SYSTEM_PROMPT
       );
@@ -257,6 +295,25 @@ export class ContentWriter {
         }
       }
     } catch (error) {
+      // RPD (daily quota) — put article back in queue, scheduled for after midnight
+      if (
+        error instanceof AIServiceError &&
+        error.type === AIErrorType.RATE_LIMIT &&
+        error.rateLimitType === RateLimitType.RPD
+      ) {
+        const resumeAt = new Date(Date.now() + (error.retryAfter ?? 0));
+        databaseService.updateArticleJob(article.id, {
+          status: 'pending_research',
+          scheduledAfter: resumeAt.toISOString(),
+        });
+        logger.warn(`Article ${article.id} paused until ${resumeAt.toUTCString()} (RPD limit)`);
+        await this.notifyArticle(
+          article,
+          `⏸️ **Article paused** — Gemini daily quota hit.\nWill resume after **${resumeAt.toUTCString()}**.`
+        );
+        return;
+      }
+
       logger.error(`Failed to write article ${article.id}:`, error);
       databaseService.updateArticleJob(article.id, { status: 'failed' });
       await this.notifyArticle(
@@ -295,6 +352,38 @@ export class ContentWriter {
   /**
    * Send a notification into the article's thread, or the writer channel as fallback.
    */
+  /**
+   * Build the initial discovery query for Phase 1 research.
+   *
+   * For focused single-topic articles (e.g. "Best ergonomic chair for programmers"),
+   * the title is already a good search query — use it directly so the researcher
+   * finds relevant chairs rather than "product categories someone would need".
+   *
+   * For broad multi-category articles (e.g. "Best home office setup"), prepend
+   * context so the researcher returns a range of product types.
+   */
+  private buildDiscoveryQuery(title: string, articleType: string): string {
+    const broadTypes = ['multi_product', 'roundup'];
+    if (broadTypes.includes(articleType)) {
+      return `Best products for: ${title} — include only specific purchasable products with brand and model names, no accessories`;
+    }
+    return `Best products for: ${title} — specific purchasable products only, no accessories or features`;
+  }
+
+  /**
+   * Build the per-product research query from a discovered topic/category.
+   *
+   * If the topic looks like a specific product name (starts with a capital letter
+   * and is short, e.g. "Herman Miller Aeron"), research it directly.
+   * Otherwise frame it within the article context.
+   */
+  private buildResearchQuery(topic: string, articleTitle: string): string {
+    const looksLikeProduct = /^[A-Z]/.test(topic) && topic.split(' ').length <= 5;
+    return looksLikeProduct
+      ? `${topic} review and specifications`
+      : `Best ${topic} for ${articleTitle}`;
+  }
+
   private notifyArticle(article: ArticleJob, message: string): Promise<void> {
     const targetId = article.discordThreadId ?? config.discord.writerChannelId;
     return discordService.sendNotification(message, targetId);

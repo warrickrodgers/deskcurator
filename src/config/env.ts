@@ -52,7 +52,10 @@ export const config = {
     // Gemini config (used by ai.service.ts and chroma.service.ts)
     gemini: {
       apiKey: env.GEMINI_API_KEY,
-      model: 'gemini-2.5-flash-lite',
+      // Lightweight model used by ContentResearcher for structured data extraction
+      model: 'gemini-3.1-flash-lite-preview',
+      // Capable model used by ContentWriter for full article generation
+      writerModel: 'gemini-3-flash-preview',
       rateLimitPerMinute: 60,
       maxRetries: 3,
       retryDelay: 1000,

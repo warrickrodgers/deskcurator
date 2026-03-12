@@ -48,6 +48,7 @@ async function main() {
       discordService.sendNotification(
         '**DeskCurator Bot Online** ✍️\n\n' +
         '`!write "<title>"` — create an article (hybrid sync/async workflow)\n' +
+        '`!retry-write <articleId>` — retry writing using existing approved research\n' +
         '`!status` — show all article jobs\n' +
         '`!cancel <jobId>` — cancel an article or research job',
         config.discord.writerChannelId
@@ -121,6 +122,11 @@ async function main() {
         `❓ No job found with ID \`${jobId}\`.`,
         config.discord.writerChannelId
       );
+    });
+
+    // Register Discord command: !retry-write <articleId>
+    discordService.registerRetryWriteHandler(async (articleId) => {
+      await contentWriter.retryWrite(articleId);
     });
 
     // Graceful shutdown

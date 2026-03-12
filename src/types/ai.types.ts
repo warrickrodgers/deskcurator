@@ -253,12 +253,23 @@ export type StreamCallback = (chunk: AIStreamChunk) => void | Promise<void>;
  */
 export enum AIErrorType {
   RATE_LIMIT = 'rate_limit',
+  SERVICE_UNAVAILABLE = 'service_unavailable',
   INVALID_REQUEST = 'invalid_request',
   AUTHENTICATION = 'authentication',
   SERVER_ERROR = 'server_error',
   NETWORK_ERROR = 'network_error',
   CONTENT_FILTER = 'content_filter',
   UNKNOWN = 'unknown'
+}
+
+/**
+ * Distinguishes which quota bucket a 429 error hit.
+ * TPM = tokens per minute (short backoff)
+ * RPD = requests per day (pause until midnight)
+ */
+export enum RateLimitType {
+  TPM = 'tpm',
+  RPD = 'rpd',
 }
 
 /**
@@ -271,7 +282,8 @@ export class AIServiceError extends Error {
     public provider: AIProvider,
     public statusCode?: number,
     public retryAfter?: number,
-    public originalError?: Error
+    public originalError?: Error,
+    public rateLimitType?: RateLimitType
   ) {
     super(message);
     this.name = 'AIServiceError';

@@ -36,6 +36,8 @@ export interface QueueResearchJob {
   failureReason?: string;
   retryCount: number;
   maxRetries: number;
+  /** ISO timestamp — job will not be dequeued until after this time (used for RPD pauses). */
+  scheduledAfter?: string;
 }
 
 export interface ArticleJob {
@@ -55,6 +57,8 @@ export interface ArticleJob {
   createdAt: string;
   completedAt?: string;
   publishedAt?: string;
+  /** ISO timestamp — article will not be polled for writing until after this time (used for RPD pauses). */
+  scheduledAfter?: string;
 }
 
 export interface ArticleRequest {

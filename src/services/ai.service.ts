@@ -7,6 +7,7 @@
 import {
   AIProvider,
   AIErrorType,
+  RateLimitType,
   AICompletionRequest,
   AICompletionResponse,
   AIStreamChunk,
@@ -31,9 +32,20 @@ export class AIService {
   private readonly maxRetries: number;
   private readonly retryDelay: number;
 
-  private async notifyRateLimit(waitMs: number, attempt: number): Promise<void> {
-    const waitSec = (waitMs / 1000).toFixed(0);
-    const msg = `⏳ **Gemini rate limit hit** (attempt ${attempt}/${this.maxRetries + 1}) — waiting **${waitSec}s** before retry.`;
+  private async notifyRateLimit(waitMs: number, attempt: number, error?: any): Promise<void> {
+    let msg: string;
+
+    if (error instanceof AIServiceError && error.type === AIErrorType.SERVICE_UNAVAILABLE) {
+      const waitMin = Math.round(waitMs / 60_000);
+      msg = `🔴 **Gemini 503** (service unavailable, attempt ${attempt}/${this.maxRetries + 1}) — waiting **${waitMin}m** before retry.`;
+    } else if (error instanceof AIServiceError && error.rateLimitType === RateLimitType.RPD) {
+      const retryAt = new Date(Date.now() + waitMs);
+      msg = `🚫 **Gemini daily quota hit** — job will be rescheduled after **${retryAt.toUTCString()}**.`;
+    } else {
+      const waitSec = (waitMs / 1000).toFixed(0);
+      msg = `⏳ **Gemini rate limit hit** (attempt ${attempt}/${this.maxRetries + 1}) — waiting **${waitSec}s** before retry.`;
+    }
+
     try {
       await discordService.sendNotification(msg, config.discord.writerChannelId);
     } catch {
@@ -41,7 +53,7 @@ export class AIService {
     }
   }
 
-  constructor() {
+  constructor(modelOverride?: string) {
     // Initialize provider based on config
     const providerType = config.ai.provider;
     const providerConfig =
@@ -49,7 +61,11 @@ export class AIService {
         ? config.ai.anthropic
         : config.ai.gemini;
 
-    this.provider = this.createProvider(providerType, providerConfig);
+    const effectiveConfig = modelOverride
+      ? { ...providerConfig, model: modelOverride }
+      : providerConfig;
+
+    this.provider = this.createProvider(providerType, effectiveConfig);
     this.rateLimiter = new RateLimiter(providerConfig.rateLimitPerMinute);
     this.maxRetries = providerConfig.maxRetries;
     this.retryDelay = providerConfig.retryDelay;
@@ -57,7 +73,7 @@ export class AIService {
     // Initialize token usage tracker
     this.tokenTracker = new TokenUsageTracker();
 
-    logger.info(`AIService initialized with provider: ${providerType}`);
+    logger.info(`AIService initialized with provider: ${providerType}, model: ${effectiveConfig.model}`);
   }
 
   private createProvider(
@@ -94,7 +110,7 @@ export class AIService {
         {
           maxRetries: this.maxRetries,
           baseDelay: this.retryDelay,
-          onWait: (waitMs, attempt) => this.notifyRateLimit(waitMs, attempt),
+          onWait: (waitMs, attempt, error) => this.notifyRateLimit(waitMs, attempt, error),
         }
       );
 
@@ -141,7 +157,7 @@ export class AIService {
         {
           maxRetries: this.maxRetries,
           baseDelay: this.retryDelay,
-          onWait: (waitMs, attempt) => this.notifyRateLimit(waitMs, attempt),
+          onWait: (waitMs, attempt, error) => this.notifyRateLimit(waitMs, attempt, error),
         }
       );
 
@@ -286,5 +302,8 @@ export class AIService {
   }
 }
 
-// Export singleton instance
+// Researcher instance — lightweight model for structured data extraction
 export const aiService = new AIService();
+
+// Writer instance — more capable model for full article generation
+export const writerAiService = new AIService(config.ai.gemini.writerModel);
