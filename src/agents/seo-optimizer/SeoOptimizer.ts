@@ -6,7 +6,7 @@ import { writerAiService } from '../../services/ai.service';
 import { databaseService } from '../../services/database.service';
 import { SEO_SYSTEM_PROMPT, seoValidationPrompt } from './context';
 import { scoreArticle, extractH1, extractHeadings, checkHeadingHierarchy } from './seoScoring';
-import { SeoResult, SeoMetadata, SeoAuditReport, AiSeoValidation } from './seoTypes';
+import { SeoResult, SeoMetadata, SeoAuditReport, AiSeoValidation, SeoDecision } from './seoTypes';
 import config from '../../config/env';
 
 const OUTPUT_DIR = path.join(process.cwd(), 'output', 'articles');
@@ -32,7 +32,7 @@ export class SeoOptimizer {
    *  10. Send audit summary to Discord thread
    *  11. Return SeoResult for ContentWriter to publish
    */
-  async run(articleId: string): Promise<SeoResult> {
+  async run(articleId: string, productCount: number = 0): Promise<SeoResult> {
     const article = databaseService.getArticleJobById(articleId);
     if (!article) throw new Error(`SeoOptimizer: no article found with ID ${articleId}`);
     if (!article.draftContent) throw new Error(`SeoOptimizer: article ${articleId} has no draft content`);
@@ -68,7 +68,8 @@ export class SeoOptimizer {
       optimizedMarkdown,
       aiValidation.suggestedTitle || article.title,
       effectiveMeta,
-      aiValidation.primaryKeyword
+      aiValidation.primaryKeyword,
+      productCount
     );
 
     // ── Build output structures ────────────────────────────────────────────
@@ -99,9 +100,18 @@ export class SeoOptimizer {
       metadata: seoMetadata,
     };
 
+    // ── Determine decision ─────────────────────────────────────────────────
+    const { decision, improvementSuggestions } = this.computeDecision(scoreResult.score, scoreResult.checks, scoreResult.failures);
+
+    // ── Map decision to DB status ──────────────────────────────────────────
+    const dbStatus =
+      decision === 'approved' ? 'seo_completed' :
+      decision === 'revise'   ? 'seo_revising'  :
+                                'failed';
+
     // ── Persist to DB ──────────────────────────────────────────────────────
     databaseService.updateArticleJob(articleId, {
-      status: 'seo_completed',
+      status: dbStatus,
       seoReport: JSON.stringify(auditReport),
     });
 
@@ -109,10 +119,11 @@ export class SeoOptimizer {
     this.writeSeoMetadata(articleId, seoMetadata);
 
     // ── Notify SEO channel ─────────────────────────────────────────────────
-    await this.notifyAudit(config.discord.seoChannelId, auditReport, article.title, articleId);
+    await this.notifyAudit(config.discord.seoChannelId, auditReport, article.title, articleId, decision, improvementSuggestions);
 
     logger.info(
       `SEO optimization complete for article ${articleId} — score: ${scoreResult.score}/100 ` +
+      `decision: ${decision} ` +
       `(${scoreResult.passed.length} passed, ${scoreResult.warnings.length} warnings, ${scoreResult.failures.length} failures)`
     );
 
@@ -120,6 +131,8 @@ export class SeoOptimizer {
       optimizedMarkdown: `${optimizedMarkdown}\n\n---\n*Meta description: ${effectiveMeta}*`,
       seoMetadata,
       auditReport,
+      decision,
+      improvementSuggestions,
     };
   }
 
@@ -270,15 +283,70 @@ export class SeoOptimizer {
     }
   }
 
+  /**
+   * Compute the SEO decision tier and build actionable improvement suggestions.
+   *
+   * Auto-fail conditions are fixable — they return 'revise' so the writer gets a
+   * chance to correct the specific issue before the loop exhausts:
+   *   wordCount < 1500 · productCount < 3 · keywordMissingFromIntro
+   *   noAffiliateLinks · missingH2Sections
+   *
+   * Score tiers (evaluated after auto-fail check):
+   *   ≥ 75 → approved
+   *   65–74 → revise (targeted improvements)
+   *   < 65  → fail  (too many issues; writer revision unlikely to recover)
+   *
+   * If the revision loop is exhausted (ContentWriter side), status → manual_review.
+   */
+  private computeDecision(
+    score: number,
+    checks: import('./seoTypes').SeoChecks,
+    failures: string[]
+  ): { decision: SeoDecision; improvementSuggestions: string[] } {
+    // Build targeted suggestions from every triggered failure
+    const suggestions: string[] = [...failures];
+    if (!checks.titleLengthOk) suggestions.push('Adjust title to 50–60 characters for optimal SERP display');
+    if (!checks.metaDescriptionOk) suggestions.push('Rewrite meta description to exactly 150–160 characters');
+    if (!checks.headingHierarchyOk) suggestions.push('Fix heading hierarchy — no skipped levels (e.g. H1 → H3)');
+    if (!checks.noBannedPhrases) suggestions.push('Remove banned marketing phrases (e.g. "industry-leading", "game-changer")');
+
+    const autoFailTriggered =
+      !checks.sufficientWordCount ||
+      !checks.sufficientProductCount ||
+      !checks.keywordInIntro ||
+      !checks.affiliateLinksPresent ||
+      !checks.hasH2Sections;
+
+    // Auto-fail conditions are always sent back for revision — never hard-fail immediately
+    if (autoFailTriggered) {
+      return { decision: 'revise', improvementSuggestions: suggestions };
+    }
+
+    if (score >= 75) {
+      return { decision: 'approved', improvementSuggestions: [] };
+    }
+
+    if (score >= 65) {
+      return { decision: 'revise', improvementSuggestions: suggestions };
+    }
+
+    // score < 65 with no auto-fail conditions — general quality too low to patch incrementally
+    return { decision: 'fail', improvementSuggestions: suggestions };
+  }
+
   private async notifyAudit(
     channelId: string,
     report: SeoAuditReport,
     title: string,
-    articleId: string
+    articleId: string,
+    decision: SeoDecision,
+    improvementSuggestions: string[]
   ): Promise<void> {
-    const scoreEmoji = report.seoScore >= 80 ? '🟢' : report.seoScore >= 60 ? '🟡' : '🔴';
+    const decisionEmoji = decision === 'approved' ? '✅' : decision === 'revise' ? '🔄' : '❌';
+    const decisionLabel = decision === 'approved' ? 'PASS' : decision === 'revise' ? 'REVISION NEEDED' : 'FAIL';
+    const scoreEmoji = report.seoScore >= 75 ? '🟢' : report.seoScore >= 65 ? '🟡' : '🔴';
     const lines = [
-      `${scoreEmoji} **SEO Audit Complete** — score **${report.seoScore}/100**`,
+      `${decisionEmoji} **SEO Audit: ${decisionLabel}** ${scoreEmoji} score **${report.seoScore}/100**`,
       `📄 "${title}" · ID: \`${articleId}\``,
       `📊 ${report.wordCount} words · Grade ${report.readabilityGrade} reading level · Intent: ${report.searchIntent} · Keyword: \`${report.keywords.primary}\``,
       '',
@@ -290,6 +358,9 @@ export class SeoOptimizer {
     }
     if (report.warnings.length > 0) {
       lines.push('', '**Warnings:**', ...report.warnings.map((w) => `  ⚠️ ${w}`));
+    }
+    if (improvementSuggestions.length > 0 && decision !== 'approved') {
+      lines.push('', '**Required improvements:**', ...improvementSuggestions.map((s) => `  🔧 ${s}`));
     }
     if (report.competitorGaps.length > 0) {
       lines.push('', '**Competitor gaps:**', ...report.competitorGaps.map((g) => `  💡 ${g}`));

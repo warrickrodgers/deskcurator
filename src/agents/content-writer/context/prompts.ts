@@ -2,52 +2,54 @@ import { ResearchFindings } from '../../../types';
 import { ArticleType } from '../../../types/jobs';
 
 /**
- * Ask the AI to identify N product categories to research for a given article title.
- * Returns a JSON array of category strings.
+ * Ask the AI to select the best 3–5 products from a pool of candidates discovered
+ * during Phase 1 research. The researcher surfaces ~8 options; this prompt curates
+ * down to the strongest candidates for per-product research queuing.
+ * Returns a JSON array of product name strings.
  */
-export function categoryDiscoveryPrompt(title: string, productCount: number): string {
-  return `You are planning research for an article titled: "${title}"
+export function categoryDiscoveryPrompt(title: string, _productCount: number): string {
+  return `You are curating the product list for an article titled: "${title}"
 
-Identify 3 to ${productCount} specific purchasable products to research. Return fewer if not enough strong options exist — quality over quantity.
+The researcher has surfaced a pool of candidate products. Select the best 3–5 from that pool for in-depth research. Return fewer than 3 only if the pool itself contains fewer strong options.
 
-Every item MUST be a real purchasable product with a brand name and a model name.
-Do NOT return: features, mechanisms, buying strategies, or product categories without a specific model.
+Selection criteria (in order of importance):
+1. Strong brand recognition and availability — real purchasable products with a known brand and model name
+2. Variety — cover different price points, form factors, or use cases to serve a wider audience
+3. Research potential — products with enough public information to write a detailed section
+4. Relevance — directly matches the article topic, not peripheral accessories unless the article is specifically about them
 
-First decide what kind of article this is:
-
-A) Single-category article — the title is about ONE product type (e.g. "Best ergonomic chairs for programmers", "Best standing desk for tall people").
-   → Return specific named products (e.g. "Herman Miller Aeron", "Steelcase Leap V2", "Branch Ergonomic Chair").
-
-B) Multi-category article — the title spans several product types (e.g. "Best home office setup for remote workers").
-   → Return one specific named product per category (e.g. "Uplift V2 standing desk", "Herman Miller Aeron chair", "Ergotron LX monitor arm").
-
-Requirements:
-- Each item must include a brand name and a model name
-- No accessories, cables, or peripheral items unless the article is specifically about them
-- No overlap
+Every selected item MUST:
+- Include a brand name and a model name (e.g. "Herman Miller Aeron", "Uplift V2 Commercial")
+- Be a real purchasable product — not a feature, mechanism, or buying strategy
+- Be distinct from all other selected items (no duplicates or near-duplicates)
 
 Respond with ONLY this JSON array, no other text:
 ["Brand Model 1", "Brand Model 2", "Brand Model 3"]`;
 }
 
 /**
- * Ask the AI to extract product names from existing research findings.
- * Used to parse products out of an initial discovery research summary.
+ * Ask the AI to select the best 3–5 products from a research summary that may
+ * describe up to ~8 candidate products discovered in Phase 1.
+ * Used to curate down to the strongest options before queuing per-product research.
  */
-export function categoryExtractionPrompt(summary: string, productCount: number): string {
-  return `The following research summary describes products relevant to a desk-setup article. Extract 3 to ${productCount} specific purchasable products from it.
+export function categoryExtractionPrompt(summary: string, _productCount: number): string {
+  return `The following research summary describes a pool of candidate products relevant to a desk-setup article. Select the best 3–5 specific purchasable products from it.
 
 Text:
 ${summary}
 
-Every item MUST be a real purchasable product with a brand name and a model name.
-Do NOT extract: features, mechanisms, buying strategies, or product categories without a specific model.
+Selection criteria (in order of importance):
+1. Strong brand recognition and real-world availability
+2. Variety across price points, form factors, or use cases
+3. Sufficient detail in the summary to justify in-depth research
+4. Direct relevance to the article topic
 
-Requirements:
-- Each item must include a brand and model name (e.g. "Herman Miller Aeron", "FlexiSpot E7")
-- Only extract items explicitly mentioned as real products in the text
-- Return fewer than ${productCount} if not enough clear products are present — do not invent entries
-- No duplicates
+Every selected item MUST:
+- Include a brand and model name (e.g. "Herman Miller Aeron", "FlexiSpot E7")
+- Be explicitly mentioned as a real product in the text — do not invent entries
+- Be distinct from all other selected items (no duplicates or near-duplicates)
+
+Return between 3 and 5 items. Return fewer only if the text contains fewer than 3 clear products.
 
 Respond with ONLY this JSON array, no other text:
 ["Brand Model 1", "Brand Model 2", "Brand Model 3"]`;
@@ -158,6 +160,38 @@ ${researchBlock}
 ${affiliateNote}
 
 Write the complete article in Markdown now.`;
+}
+
+/**
+ * Rewrite an article draft incorporating SEO improvement feedback.
+ * Used when the SEO optimizer returns a 'revise' decision.
+ */
+export function articleRevisionPrompt(
+  title: string,
+  articleType: ArticleType,
+  researchItems: ResearchFindings[],
+  previousDraft: string,
+  improvementSuggestions: string[],
+  affiliateTag?: string
+): string {
+  const basePrompt = articleGenerationPrompt(title, articleType, researchItems, affiliateTag);
+  const suggestionBlock = improvementSuggestions.map((s, i) => `${i + 1}. ${s}`).join('\n');
+
+  return `${basePrompt}
+
+---
+
+# REVISION BRIEF
+
+The previous draft was reviewed by the SEO optimizer and returned the following required improvements. You MUST address every point before writing the revised article.
+
+**Required improvements:**
+${suggestionBlock}
+
+**Previous draft (for reference — do not copy, rewrite from scratch):**
+${previousDraft.substring(0, 4000)}${previousDraft.length > 4000 ? '\n*(truncated)*' : ''}
+
+Write a complete revised article in Markdown that satisfies all the required improvements above.`;
 }
 
 /**

@@ -4,10 +4,14 @@ export interface SeoChecks {
   hasH2Sections: boolean;
   keywordInIntro: boolean;
   sufficientWordCount: boolean;
+  sufficientProductCount: boolean;
   headingHierarchyOk: boolean;
   noBannedPhrases: boolean;
   affiliateLinksPresent: boolean;
 }
+
+/** Decision tier returned by the SEO optimizer after scoring. */
+export type SeoDecision = 'approved' | 'revise' | 'fail';
 
 export interface SeoMetadata {
   title: string;
@@ -41,6 +45,9 @@ export interface SeoResult {
   optimizedMarkdown: string;
   seoMetadata: SeoMetadata;
   auditReport: SeoAuditReport;
+  decision: SeoDecision;
+  /** Actionable improvement suggestions returned when decision is 'revise'. */
+  improvementSuggestions: string[];
 }
 
 /** Shape returned by the AI SEO validation prompt. */

@@ -106,7 +106,7 @@ export class DatabaseService {
 
       CREATE TABLE IF NOT EXISTS article_jobs (
         id TEXT PRIMARY KEY,
-        status TEXT NOT NULL CHECK(status IN ('pending_research','writing','awaiting_approval','approved','seo_optimizing','seo_completed','rejected','published','failed')),
+        status TEXT NOT NULL CHECK(status IN ('pending_research','writing','awaiting_approval','approved','seo_optimizing','seo_completed','seo_revising','manual_review','rejected','published','failed')),
         title TEXT NOT NULL,
         article_type TEXT NOT NULL CHECK(article_type IN ('single_product','multi_product','comparison','roundup')),
         research_job_ids TEXT NOT NULL DEFAULT '[]',
@@ -115,6 +115,7 @@ export class DatabaseService {
         draft_content TEXT,
         final_content TEXT,
         seo_report TEXT,
+        revision_count INTEGER NOT NULL DEFAULT 0,
         discord_message_id TEXT,
         discord_thread_id TEXT,
         published_url TEXT,
@@ -131,6 +132,7 @@ export class DatabaseService {
       `ALTER TABLE queue_research_jobs ADD COLUMN scheduled_after TEXT`,
       `ALTER TABLE article_jobs ADD COLUMN scheduled_after TEXT`,
       `ALTER TABLE article_jobs ADD COLUMN seo_report TEXT`,
+      `ALTER TABLE article_jobs ADD COLUMN revision_count INTEGER NOT NULL DEFAULT 0`,
     ];
     for (const sql of columnMigrations) {
       try { this.conn.exec(sql); } catch { /* column already exists */ }
@@ -142,13 +144,17 @@ export class DatabaseService {
       .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='article_jobs'`)
       .get() as { sql: string } | undefined;
 
-    if (articleJobsSchema && !articleJobsSchema.sql.includes('seo_optimizing')) {
+    const FULL_STATUS_LIST = `'pending_research','writing','awaiting_approval','approved','seo_optimizing','seo_completed','seo_revising','manual_review','rejected','published','failed'`;
+    if (
+      articleJobsSchema &&
+      (!articleJobsSchema.sql.includes('seo_optimizing') || !articleJobsSchema.sql.includes('manual_review'))
+    ) {
       this.conn.transaction(() => {
         this.conn.exec(`ALTER TABLE article_jobs RENAME TO article_jobs_backup`);
         this.conn.exec(`
           CREATE TABLE article_jobs (
             id TEXT PRIMARY KEY,
-            status TEXT NOT NULL CHECK(status IN ('pending_research','writing','awaiting_approval','approved','seo_optimizing','seo_completed','rejected','published','failed')),
+            status TEXT NOT NULL CHECK(status IN (${FULL_STATUS_LIST})),
             title TEXT NOT NULL,
             article_type TEXT NOT NULL CHECK(article_type IN ('single_product','multi_product','comparison','roundup')),
             research_job_ids TEXT NOT NULL DEFAULT '[]',
@@ -157,6 +163,7 @@ export class DatabaseService {
             draft_content TEXT,
             final_content TEXT,
             seo_report TEXT,
+            revision_count INTEGER NOT NULL DEFAULT 0,
             discord_message_id TEXT,
             discord_thread_id TEXT,
             published_url TEXT,
@@ -181,7 +188,7 @@ export class DatabaseService {
         `);
         this.conn.exec(`DROP TABLE article_jobs_backup`);
       })();
-      logger.info('DatabaseService: article_jobs migrated to include seo_optimizing/seo_completed statuses');
+      logger.info('DatabaseService: article_jobs migrated to include seo_revising/manual_review statuses');
     }
   }
 
@@ -426,6 +433,7 @@ export class DatabaseService {
       status: ArticleJobStatus;
       researchJobIds: string;
       requiredResearchCount: number;
+      revisionCount: number;
       draftContent: string;
       finalContent: string;
       seoReport: string;
@@ -443,6 +451,7 @@ export class DatabaseService {
     if (fields.status !== undefined) { setClauses.push('status = @status'); params.status = fields.status; }
     if (fields.researchJobIds !== undefined) { setClauses.push('research_job_ids = @researchJobIds'); params.researchJobIds = fields.researchJobIds; }
     if (fields.requiredResearchCount !== undefined) { setClauses.push('required_research_count = @requiredResearchCount'); params.requiredResearchCount = fields.requiredResearchCount; }
+    if (fields.revisionCount !== undefined) { setClauses.push('revision_count = @revisionCount'); params.revisionCount = fields.revisionCount; }
     if (fields.draftContent !== undefined) { setClauses.push('draft_content = @draftContent'); params.draftContent = fields.draftContent; }
     if (fields.finalContent !== undefined) { setClauses.push('final_content = @finalContent'); params.finalContent = fields.finalContent; }
     if (fields.seoReport !== undefined) { setClauses.push('seo_report = @seoReport'); params.seoReport = fields.seoReport; }
@@ -466,6 +475,7 @@ export class DatabaseService {
     draft_content              AS draftContent,
     final_content              AS finalContent,
     seo_report                 AS seoReport,
+    revision_count             AS revisionCount,
     discord_message_id         AS discordMessageId,
     discord_thread_id          AS discordThreadId,
     published_url              AS publishedUrl,

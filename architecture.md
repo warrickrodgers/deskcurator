@@ -1,29 +1,37 @@
 # DeskCurator — Architecture
 
-**Status:** Phase 3 complete (ContentWriter agent operational with quality gates and error resilience)
+**Status:** Phase 4 complete (SeoOptimizer agent operational with scoring, decision tiers, and revision loop)
 **Last Updated:** March 2026
 
 ---
 
 ## Overview
 
-DeskCurator is a two-agent Discord bot for generating affiliate content about desk-setup products. The agents communicate via a SQLite job queue and interact with a human admin through separate Discord channels.
+DeskCurator is a three-agent Discord bot for generating affiliate content about desk-setup products. The agents communicate via a SQLite job queue and interact with a human admin through separate Discord channels.
 
 ```
 Admin
   │
   ├── #content-researcher ──► ContentResearcher Agent
-  │                               │ Pre-flight product validation
-  │                               │ Tavily search (3 parallel)
+  │                               │ AI-driven product discovery (discoverProducts)
+  │                               │ Pre-flight product validation (Gemini)
+  │                               │ Tavily search (3 parallel per product)
   │                               │ Gemini Flash Lite analysis
   │                               │ ChromaDB dedup
   │                               │ Confidence scoring (75% threshold)
   │                               │ SQLite persistence
   │
-  └── #writer-editor ────────► ContentWriter Agent
-          (threads per article)       │ Hybrid sync/async workflow
-                                      │ Reads from SQLite queue
-                                      │ Gemini Flash article generation
+  ├── #writer-editor ────────► ContentWriter Agent
+  │       (threads per article)       │ Calls discoverProducts() for Phase 1
+  │                                   │ Reads from SQLite queue
+  │                                   │ Gemini Flash article generation
+  │                                   │ SEO revision loop (max 2 attempts)
+  │
+  └── #seo-optimizer ─────────► SeoOptimizer Agent
+                                    │ Deterministic scoring (9 checks)
+                                    │ AI keyword/slug/readability validation
+                                    │ Decision: approved / revise / fail
+                                    │ Revision briefs for ContentWriter
 ```
 
 ---
@@ -35,8 +43,8 @@ Three dedicated channels enforce strict separation of concerns:
 | Channel | Agent | Commands | Notifications |
 |---|---|---|---|
 | `#content-researcher` | ContentResearcher | `!research <product>` | Research approval embeds, validation skip/reject notices, confidence rejection alerts |
-| `#writer-editor` | ContentWriter | `!write "<title>"`, `!status`, `!cancel <jobId>`, `!retry-write <articleId>`, `!seo-report <articleId>` | Article threads, startup message |
-| `#seo-optimizer` | SeoOptimizer | — | SEO audit reports (score, keyword, checks, competitor gaps) posted automatically after each article is approved |
+| `#writer-editor` | ContentWriter | `!write "<title>"`, `!status`, `!cancel <jobId>`, `!retry-write <articleId>`, `!seo-report <articleId>` | Article threads, draft approval, publish confirmation, SEO revision/manual_review alerts |
+| `#seo-optimizer` | SeoOptimizer | — | SEO audit reports (score, keyword, checks, competitor gaps) posted automatically after each article run |
 
 **Env var:** `DISCORD_SEO_OPTIMIZER_CHANNEL_ID` → `config.discord.seoChannelId`
 
@@ -48,6 +56,8 @@ When `!write` is issued, ContentWriter creates a **public Discord thread** insid
 - Parallel research jobs queued
 - Writing in progress
 - Draft approval embed (Approve / Reject / Request Edit)
+- SEO revision notifications (attempt N of 2)
+- Manual review flags
 - Published confirmation
 
 Individual **research job approvals** always appear in `#content-researcher`, regardless of whether they were queued by the writer or triggered by `!research`.
@@ -62,8 +72,24 @@ Individual **research job approvals** always appear in `#content-researcher`, re
 
 Runs two modes concurrently:
 
-1. **Direct research** — called synchronously by ContentWriter for initial category discovery, or triggered by `!research` command.
-2. **Queue polling** — polls `queue_research_jobs` every 5 seconds for pending writer-created jobs.
+1. **AI-driven discovery** — called by ContentWriter for Phase 1 product discovery. No Tavily search; uses Gemini to enumerate ~8 real products, then validates each candidate.
+2. **Queue polling** — polls `queue_research_jobs` every 5 seconds for pending per-product research jobs.
+
+#### Phase 1: Product Discovery
+
+```
+discoverProducts(topic, count=8)
+  │
+  ├─ Gemini Flash Lite: discoverProductsPrompt → { products: [{brand, model, name}, ...] }
+  ├─ Parse JSON → candidate name list
+  └─ Parallel validation (validateProductPrompt per candidate)
+       ├─ valid → include in results
+       ├─ invalid → exclude
+       └─ AI error → fail-open, include anyway
+       → returns string[] of confirmed product names
+```
+
+#### Phase 2: Per-Product Deep Research
 
 ```
 researchProduct(query, { skipValidation? })
@@ -91,10 +117,6 @@ researchProduct(query, { skipValidation? })
 
 Queue job processing re-uses `researchProduct()` and then updates the `queue_research_jobs` row + increments the parent article's `completedResearchCount`. RPD rate limit errors reschedule the job until after midnight without consuming a retry.
 
-#### Product Validation
-
-Before any expensive searches run, a Gemini call checks whether the topic is a real purchasable product (brand + model). Topics that are features, mechanisms, buying strategies, or generic categories are rejected immediately. Discovery queries from ContentWriter pass `skipValidation: true` to bypass this check — article titles aren't product names.
-
 #### Confidence Scoring
 
 Scores are calculated from: high-credibility source count, number of pros/cons extracted, total source count, and average Tavily relevance score. Research scoring below **75%** is automatically rejected and never sent for Discord approval.
@@ -105,16 +127,16 @@ Scores are calculated from: high-credibility source count, number of pros/cons e
 
 **File:** [src/agents/content-writer/ContentWriter.ts](src/agents/content-writer/ContentWriter.ts)
 
-Hybrid sync/async workflow:
+Hybrid sync/async workflow with integrated SEO revision loop:
 
 ```
 createArticle(request)          ← triggered by !write
   │
   ├─ Create Discord thread in #writer-editor
   │
-  ├─ [SYNC] Build discovery query (product-focused, skipValidation: true)
-  │    → contentResearcher.researchProduct(discoveryQuery, { skipValidation: true })
-  │    → extract 3–5 specific named products via AI (categoryDiscovery / categoryExtraction)
+  ├─ [PHASE 1] AI Product Discovery
+  │    → contentResearcher.discoverProducts(title)
+  │    → returns 3–8 validated product names
   │
   ├─ INSERT article_job (status: pending_research)
   ├─ INSERT 3–5 × queue_research_jobs (status: pending, priority: 7)
@@ -131,10 +153,29 @@ writeArticle(article, jobs)
   │
   ├─ Gemini Flash: articleGenerationPrompt → structured buyer's guide markdown
   ├─ Gemini Flash: seoMetaPrompt → meta description
+  ├─ Combine: draft + "\n\n---\n*Meta description: <text>*"
   ├─ Update article_job (status: awaiting_approval, draftContent)
   ├─ Discord approval in article thread
-  │    → approved: publishArticle()
+  │    → approved: runSeoRevisionLoop()
   └─   → rejected: update status, post feedback to thread
+
+runSeoRevisionLoop(article, researchItems)      ← max 2 revision attempts
+  │
+  ├─ Loop: attempt 0 → MAX_REVISIONS (2)
+  │    │
+  │    ├─ seoOptimizer.run(articleId, productCount)
+  │    │
+  │    ├─ decision: 'approved' → publishArticle(), break
+  │    │
+  │    ├─ decision: 'fail' → status: failed, notify thread, return
+  │    │
+  │    └─ decision: 'revise'
+  │         ├─ attempt >= MAX_REVISIONS → status: manual_review, notify thread, return
+  │         ├─ status: seo_revising, revisionCount: attempt+1
+  │         ├─ Gemini Flash: articleRevisionPrompt (with improvement suggestions + previous draft)
+  │         ├─ Gemini Flash: seoMetaPrompt
+  │         ├─ Update article_job (draftContent: revisedDraft, status: approved)
+  │         └─ Continue loop (next iteration re-runs SEO)
 
 retryWrite(articleId)           ← triggered by !retry-write <articleId>
   ├─ Lookup article_job from database
@@ -147,15 +188,7 @@ publishArticle()
   └─ Notify thread: "Article published!"
 ```
 
-**AI Model:** `gemini-3-flash-preview` — more capable model used for full article generation.
-
-#### Discovery Query Logic
-
-`buildDiscoveryQuery` produces product-focused prompts without accessories:
-- **Broad articles** (multi_product, roundup): returns a range across categories
-- **Focused articles** (single_product, comparison): keeps results within one product type
-
-Product count is flexible: prompts ask for **3 to N** products (where N is at most 5), returning fewer if quality products are scarce.
+**AI Model:** `gemini-3-flash-preview` — more capable model used for full article generation and revision.
 
 #### Article Generation (Buyer's Guide Format)
 
@@ -168,6 +201,103 @@ Articles follow a structured buyer's guide format:
 6. FAQ with research-backed answers
 
 Banned phrases: "premium quality", "great for productivity", "perfect for any workspace", "industry-leading", "game-changer", "best in class"
+
+---
+
+### SeoOptimizer
+
+**File:** [src/agents/seo-optimizer/SeoOptimizer.ts](src/agents/seo-optimizer/SeoOptimizer.ts)
+
+Runs after every article draft approval. Performs deterministic scoring, AI validation, applies structural improvements, computes a decision, and posts an audit report to `#seo-optimizer`.
+
+```
+run(articleId, productCount)
+  │
+  ├─ Load article from DB, set status → seo_optimizing
+  ├─ splitDraft() → articleMarkdown + metaDescription
+  │
+  ├─ AI validation (Gemini Flash: seoValidationPrompt)
+  │    → primaryKeyword, secondaryKeywords, suggestedTitle, suggestedSlug
+  │    → readabilityGrade, searchIntent, thinSections, competitorGaps
+  │    → error: fallback keyword derived from article title
+  │
+  ├─ applyImprovements()
+  │    → insert H1 if missing (uses suggestedTitle or article title)
+  │    → replace H1 if AI suggests a better title
+  │    → fixHeadingHierarchy() if skipped levels detected
+  │
+  ├─ scoreArticle() — 9 deterministic checks (pure functions)
+  │
+  ├─ computeDecision(score, checks, failures)
+  │    → auto-fail triggered? → 'revise' (writer must fix)
+  │    → score ≥ 75         → 'approved'
+  │    → score 65–74        → 'revise'
+  │    → score < 65         → 'fail'
+  │
+  ├─ Persist: seoReport (JSON), status → seo_completed / seo_revising / failed
+  ├─ Write output/articles/<id>_seo.json
+  ├─ Post audit to #seo-optimizer
+  └─ Return SeoResult { optimizedMarkdown, seoMetadata, auditReport, decision, improvementSuggestions }
+```
+
+#### Deterministic Scoring (9 Checks)
+
+All checks are pure functions in [src/agents/seo-optimizer/seoScoring.ts](src/agents/seo-optimizer/seoScoring.ts). Score starts at 100, deductions applied per failure.
+
+| Check | Pass Condition | Deduction | Auto-Fail |
+|---|---|---|---|
+| `sufficientWordCount` | ≥ 1500 words | −20 | Yes |
+| `sufficientProductCount` | ≥ 3 products covered | −15 | Yes |
+| `keywordInIntro` | Primary keyword in first 150 words | −15 | Yes |
+| `affiliateLinksPresent` | ≥ 1 Amazon affiliate link | −10 | Yes |
+| `hasH2Sections` | ≥ 3 H2 headings | −15 | Yes |
+| `titleLengthOk` | Title 50–60 characters | −10 | No |
+| `metaDescriptionOk` | Meta description 150–160 characters | −10 | No |
+| `headingHierarchyOk` | No skipped heading levels | −5 | No |
+| `noBannedPhrases` | No banned marketing phrases | −5 | No |
+
+**Auto-fail conditions** always return `'revise'` (not `'fail'`) — the writer gets a chance to fix the specific issue. Hard `'fail'` only occurs when score < 65 with no auto-fail conditions triggered.
+
+#### Decision Tiers
+
+| Score | Auto-fail? | Decision | Next action |
+|---|---|---|---|
+| any | Yes | `revise` | Writer regenerates with improvement brief |
+| ≥ 75 | No | `approved` | Article published |
+| 65–74 | No | `revise` | Writer regenerates with improvement brief |
+| < 65 | No | `fail` | Article marked failed |
+
+After **2 revision attempts** without approval → `manual_review` (flagged in `#writer-editor` thread).
+
+---
+
+## Article Job Status Lifecycle
+
+```
+pending_research
+    │
+    ├── (all research approved) ──► writing
+    │                                   │
+    │                                   ▼
+    │                           awaiting_approval
+    │                               │         │
+    │                           approved    rejected
+    │                               │
+    │                               ▼
+    │                         seo_optimizing
+    │                          │    │    │
+    │                    approved  revise  fail
+    │                       │       │       │
+    │                  seo_completed │    failed
+    │                               │
+    │                         seo_revising
+    │                          (attempts 1–2)
+    │                               │
+    │                     approved? → seo_completed
+    │                     exhausted? → manual_review
+    │
+    └── seo_completed ──► published
+```
 
 ---
 
@@ -191,7 +321,7 @@ RPD detection uses response keywords ("per_day", "DAILY") or retry delay > 1 hou
 
 **File:** [src/services/database.service.ts](src/services/database.service.ts)
 
-Schema uses additive migrations — safe to run against existing databases.
+Schema uses additive migrations — safe to run against existing databases. CHECK constraint changes are handled via table recreation (SQLite limitation).
 
 ### `products`
 Tracks product metadata created during research flows.
@@ -258,19 +388,21 @@ Tracks full article lifecycle from queue to publish.
 | Column | Type | Notes |
 |---|---|---|
 | id | TEXT PK | UUID |
-| status | TEXT | pending_research / writing / awaiting_approval / approved / rejected / published / failed |
+| status | TEXT | pending_research / writing / awaiting_approval / approved / rejected / seo_optimizing / seo_completed / seo_revising / manual_review / failed / published |
 | title | TEXT | e.g. "Best Standing Desks for Tall People" |
 | article_type | TEXT | single_product / multi_product / comparison / roundup |
 | research_job_ids | TEXT | JSON array of queue_research_job IDs |
 | required_research_count | INTEGER | |
 | completed_research_count | INTEGER | incremented on each approval |
-| draft_content | TEXT | AI-generated markdown |
+| draft_content | TEXT | AI-generated markdown (updated each revision) |
 | final_content | TEXT | approved final version |
+| seo_report | TEXT | JSON-serialized SeoAuditReport |
+| revision_count | INTEGER | number of SEO revision attempts (default 0) |
 | discord_message_id | TEXT | approval message |
 | discord_thread_id | TEXT | writer-editor thread for this article |
 | published_url | TEXT | future CMS URL |
 | created_at / completed_at / published_at | TEXT | |
-| scheduled_after | TEXT | ISO timestamp — holds article polling until time passes (used for RPD pausing) |
+| scheduled_after | TEXT | ISO timestamp — holds article polling until time passes |
 
 ---
 
@@ -279,12 +411,12 @@ Tracks full article lifecycle from queue to publish.
 ### AI Service
 **File:** [src/services/ai.service.ts](src/services/ai.service.ts)
 
-Provider abstraction over Gemini and Anthropic. Two instances are exported:
+Provider abstraction over Gemini and Anthropic. Three instances are exported:
 
 | Export | Model | Used by |
 |---|---|---|
 | `aiService` | `gemini-3.1-flash-lite-preview` | ContentResearcher — structured JSON extraction |
-| `writerAiService` | `gemini-3-flash-preview` | ContentWriter — full article generation |
+| `writerAiService` | `gemini-3-flash-preview` | ContentWriter — article generation; SeoOptimizer — AI validation |
 
 Features:
 - Swappable provider via `config.ai.provider`
@@ -305,7 +437,7 @@ Vector store for research deduplication.
 ### Search Service
 **File:** [src/services/search.service.ts](src/services/search.service.ts)
 
-Wraps the Tavily API. Runs three parallel searches per product:
+Wraps the Tavily API. Runs three parallel searches per product (Phase 2 only — Phase 1 discovery is AI-only):
 - General product info
 - User reviews
 - Competitor landscape
@@ -314,11 +446,11 @@ Wraps the Tavily API. Runs three parallel searches per product:
 **File:** [src/services/discord.ts](src/services/discord.ts)
 
 Manages all Discord interactions:
-- **Channel routing** — `!research` only handled in researcher channel; `!write`/`!status`/`!cancel`/`!retry-write` only in writer channel
+- **Channel routing** — `!research` only handled in researcher channel; `!write`/`!status`/`!cancel`/`!retry-write`/`!seo-report` only in writer channel
 - **`sendNotification(message, channelId?)`** — sends to researcher channel by default; accepts explicit channel or thread ID
 - **`requestApproval(request, channelId?)`** — posts embed with Approve / Reject / Request Edit buttons; waits for interaction
 - **`createArticleThread(title)`** — creates a public thread in the writer channel; returns thread ID
-- **Handler registration** — `registerResearchHandler`, `registerWriteHandler`, `registerStatusHandler`, `registerCancelHandler`, `registerRetryWriteHandler`
+- **Handler registration** — `registerResearchHandler`, `registerWriteHandler`, `registerStatusHandler`, `registerCancelHandler`, `registerRetryWriteHandler`, `registerSeoReportHandler`
 
 ### Job Queue Service
 **File:** [src/services/jobQueue.service.ts](src/services/jobQueue.service.ts)
@@ -331,7 +463,7 @@ Thin wrapper over `databaseService` for queue semantics:
 ### Database Service
 **File:** [src/services/database.service.ts](src/services/database.service.ts)
 
-SQLite via `better-sqlite3`. WAL mode, foreign keys enabled. All SELECT queries use explicit column aliases for snake_case → camelCase mapping. Additive migrations run on startup (safe on existing databases). Both `queue_research_jobs` and `article_jobs` have a `scheduled_after` column added via migration to support RPD pausing.
+SQLite via `better-sqlite3`. WAL mode, foreign keys enabled. All SELECT queries use explicit column aliases for snake_case → camelCase mapping. Additive migrations run on startup (safe on existing databases). Table recreation migration handles CHECK constraint changes (new statuses, new columns) by detecting missing values and rebuilding `article_jobs` with data preserved.
 
 ---
 
@@ -342,6 +474,7 @@ SQLite via `better-sqlite3`. WAL mode, foreign keys enabled. All SELECT queries 
 
 | Prompt | Purpose |
 |---|---|
+| `discoverProductsPrompt` | Ask Gemini to enumerate ~8 real named products (brand + model) for an article topic |
 | `validateProductPrompt` | Pre-flight check: is this a real purchasable product with brand + model? |
 | `analyzeProsConsPrompt` | Extract structured pros/cons JSON from search results |
 | `competitorPrompt` | Identify top 3–5 competitors with differentiators |
@@ -352,10 +485,16 @@ SQLite via `better-sqlite3`. WAL mode, foreign keys enabled. All SELECT queries 
 
 | Prompt | Purpose |
 |---|---|
-| `categoryDiscoveryPrompt` | Generate 3–N specific named products (brand + model) for an article title |
-| `categoryExtractionPrompt` | Parse 3–N named products from an existing research summary |
 | `articleGenerationPrompt` | Write structured buyer's guide (intro, table, products, considerations, verdict, FAQ) |
+| `articleRevisionPrompt` | Rewrite article incorporating SEO improvement brief + previous draft for reference |
 | `seoMetaPrompt` | Write a 150–160 char SEO meta description |
+
+### SeoOptimizer
+**File:** [src/agents/seo-optimizer/context/](src/agents/seo-optimizer/context/)
+
+| Prompt | Purpose |
+|---|---|
+| `seoValidationPrompt` | Extract primaryKeyword, secondaryKeywords, suggestedTitle, suggestedSlug, readabilityGrade, searchIntent, thinSections, competitorGaps |
 
 ---
 
@@ -364,48 +503,68 @@ SQLite via `better-sqlite3`. WAL mode, foreign keys enabled. All SELECT queries 
 ```
 T+0s   Admin: !write "Best Standing Desks for Tall People"
 T+1s   Bot creates Discord thread: "Best Standing Desks for Tall People"
-T+2s   Thread: "Phase 1: running initial discovery…"
-T+2s   ContentResearcher: researches "Best products for: Best Standing Desks for Tall People"
-           (skipValidation: true — title is not a product name)
-T+12s  #content-researcher: approval embed for discovery research
-T+15s  Admin: Approve
-T+16s  Thread: "Phase 1 complete — 4 products found:
-               Uplift V2 Commercial, FlexiSpot E7 Pro, Jarvis Bamboo, Autonomous SmartDesk Pro
-               Queued 4 research jobs"
+T+2s   Thread: "Phase 1: discovering products…"
 
-T+17s  queue_research_jobs: 4 rows inserted (status: pending)
+── [PHASE 1] AI Product Discovery ───────────────────────────────────────────
 
-── ContentResearcher polls every 5s ──────────────────────────────────────────
+T+3s   ContentResearcher: discoverProducts("Best Standing Desks for Tall People")
+           Gemini: discoverProductsPrompt → 8 candidate products
+           Parallel validation: 6 pass, 2 fail → 6 confirmed products
+T+8s   Thread: "Phase 1 complete — 5 products queued for research:
+               Uplift V2 Commercial, FlexiSpot E7 Pro, Jarvis Bamboo,
+               Autonomous SmartDesk Pro, Flexispot E7"
 
-T+20s  Picks up job: "Uplift V2 Commercial review and specifications"
-           Pre-flight validation: passes (brand + model present)
-T+35s  confidence: 88% — passes threshold
-T+35s  #content-researcher: approval embed
-T+38s  Admin: Approve  →  job approved, article completedCount → 1/4
+── [PHASE 2] Parallel Research Queue ────────────────────────────────────────
 
-T+40s  Picks up job: "FlexiSpot E7 Pro review and specifications"
-T+55s  Admin: Approve  →  completedCount → 2/4
+T+9s   queue_research_jobs: 5 rows inserted (status: pending)
 
-       … (repeat for Jarvis Bamboo, Autonomous SmartDesk Pro) …
+T+12s  ContentResearcher picks up: "Uplift V2 Commercial"
+           Tavily: 3 parallel searches
+           Gemini: pros/cons + competitor analysis + summary
+T+27s  confidence: 88% — passes threshold
+T+27s  #content-researcher: approval embed
+T+30s  Admin: Approve  →  completedCount → 1/5
 
-T+3m   All 4 jobs approved, completedCount → 4/4
+       … (repeat for all 5 products) …
 
-── ContentWriter polls every 10s ─────────────────────────────────────────────
+T+4m   All 5 jobs approved, completedCount → 5/5
 
-T+3m   Detects all research complete for article
-T+3m   Thread: "Writing article… generating draft now…"
-T+4m   Gemini Flash generates full buyer's guide markdown + SEO meta
-T+4m   article_jobs: status → awaiting_approval
-T+4m   Thread: approval embed with article draft preview
-T+7m   Admin: Approve
-T+7m   output/articles/<id>.md written
-T+7m   Thread: "Article published! File: output/articles/<id>.md"
+── [PHASE 3] Article Generation ──────────────────────────────────────────────
 
-── Manual retry example ──────────────────────────────────────────────────────
+T+4m   ContentWriter detects all research complete
+T+4m   Thread: "Writing article… generating draft now…"
+T+5m   Gemini Flash: articleGenerationPrompt → full buyer's guide
+T+5m   Gemini Flash: seoMetaPrompt → meta description
+T+5m   article_jobs: status → awaiting_approval
+T+5m   Thread: approval embed with article draft preview
+T+8m   Admin: Approve
 
-       Admin: !retry-write abc123
-       Bot looks up article abc123, finds its approved research jobs
-       Calls writeArticle() directly — no new research needed
+── [PHASE 4] SEO Optimization ────────────────────────────────────────────────
+
+T+8m   seoOptimizer.run(articleId, productCount=5)
+           AI validation: primaryKeyword = "standing desks tall people"
+           Deterministic scoring: 8/9 checks passed → score 82
+           Decision: approved (≥75, no auto-fail)
+T+8m   #seo-optimizer: "✅ SEO Audit: PASS 🟢 score 82/100"
+T+8m   output/articles/<id>.md written
+T+8m   output/articles/<id>_seo.json written
+T+8m   Thread: "Article published! File: output/articles/<id>.md"
+
+── SEO Revision Example ──────────────────────────────────────────────────────
+
+       [If keyword missing from intro — auto-fail → revise]
+       seoOptimizer returns: decision='revise'
+         improvementSuggestions: ["Primary keyword 'best standing desks tall' not found in first 150 words"]
+       ContentWriter: articleRevisionPrompt with improvement brief + previous draft
+       Gemini Flash rewrites article
+       seoOptimizer.run() attempt 2 → score 78 → approved ✅
+
+── Manual review example ─────────────────────────────────────────────────────
+
+       [If 2 revisions exhausted without approval]
+       article_jobs: status → manual_review
+       Thread: "⚠️ SEO revision attempts exhausted — manual review required"
+       Admin addresses issues manually, then: !retry-write <articleId>
 ```
 
 ---
@@ -421,6 +580,7 @@ All config is in [src/config/env.ts](src/config/env.ts), validated with Zod on s
 | `DISCORD_GUILD_ID` | Yes | Server ID |
 | `DISCORD_RESEARCHER_CHANNEL_ID` | Yes | `#content-researcher` channel ID |
 | `DISCORD_WRITER_CHANNEL_ID` | Yes | `#writer-editor` channel ID |
+| `DISCORD_SEO_OPTIMIZER_CHANNEL_ID` | Yes | `#seo-optimizer` channel ID |
 | `DISCORD_ADMIN_USER_ID` | Yes | Your Discord user ID (receives approval pings) |
 | `GEMINI_API_KEY` | Yes | Google Gemini API key |
 | `ANTHROPIC_API_KEY` | No | Claude API key (optional, swap via `config.ai.provider`) |

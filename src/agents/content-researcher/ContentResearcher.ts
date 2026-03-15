@@ -6,7 +6,7 @@ import { searchService, SearchResult } from '../../services/search.service';
 import { chromaService } from '../../services/chroma.service';
 import { databaseService } from '../../services/database.service';
 import { jobQueueService } from '../../services/jobQueue.service';
-import { SYSTEM_PROMPT, validateProductPrompt, analyzeProsConsPrompt, competitorPrompt, summaryPrompt } from './context';
+import { SYSTEM_PROMPT, discoverProductsPrompt, validateProductPrompt, analyzeProsConsPrompt, competitorPrompt, summaryPrompt } from './context';
 import { ResearchFindings, Product, ApprovalRequest, Source } from '../../types';
 import { QueueResearchJob } from '../../types/jobs';
 import { AIServiceError, AIErrorType, RateLimitType } from '../../types/ai.types';
@@ -151,6 +151,47 @@ export class ContentResearcher {
     }
   }
 
+  /**
+   * Phase 1 discovery: ask AI to name real products in a category, then validate
+   * each one before returning the list. Returns all validated product names.
+   * Callers should slice to the desired count before queuing per-product research.
+   */
+  async discoverProducts(topic: string, count: number = 8): Promise<string[]> {
+    logger.info(`ContentResearcher: discovering products for "${topic}" (target: ${count})`);
+
+    const raw = await aiService.ask(discoverProductsPrompt(topic, count), SYSTEM_PROMPT);
+    const candidates = this.parseDiscoverProductsResponse(raw);
+
+    if (candidates.length === 0) {
+      logger.warn(`No products discovered for "${topic}"`);
+      return [];
+    }
+
+    logger.info(`Discovered ${candidates.length} candidates — validating each…`);
+
+    // Validate in parallel; fail-open so a single bad AI response doesn't drop good products
+    const results = await Promise.all(
+      candidates.map(async (name: string) => {
+        try {
+          const vRaw = await aiService.ask(validateProductPrompt(name), SYSTEM_PROMPT);
+          const v = this.parseValidationResponse(vRaw);
+          if (!v.valid) {
+            logger.debug(`Discovery: filtered out "${name}" — ${v.reason}`);
+            return null;
+          }
+          return name;
+        } catch {
+          logger.warn(`Validation threw for "${name}" — including as candidate`);
+          return name;
+        }
+      })
+    );
+
+    const valid = results.filter((n): n is string => n !== null);
+    logger.info(`Discovery complete: ${valid.length}/${candidates.length} validated for "${topic}"`);
+    return valid;
+  }
+
   async researchProduct(
     productQuery: string,
     options: { skipValidation?: boolean } = {}
@@ -267,7 +308,7 @@ export class ContentResearcher {
       const confidence = this.calculateConfidence(sources, pros, cons, infoResults);
 
       // Reject low-confidence research before storing or requesting approval
-      const CONFIDENCE_THRESHOLD = 0.75;
+      const CONFIDENCE_THRESHOLD = 0.70;
       if (confidence < CONFIDENCE_THRESHOLD) {
         logger.warn(
           `Research for "${productQuery}" rejected — confidence ${(confidence * 100).toFixed(0)}% is below threshold (${CONFIDENCE_THRESHOLD * 100}%)`
@@ -356,6 +397,22 @@ export class ContentResearcher {
         : 'low',
       dateAccessed: new Date(),
     };
+  }
+
+  private parseDiscoverProductsResponse(raw: string): string[] {
+    try {
+      const cleaned = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      const parsed = JSON.parse(cleaned);
+      if (Array.isArray(parsed.products)) {
+        return parsed.products
+          .filter((p: { name?: string }) => typeof p.name === 'string' && p.name.trim())
+          .map((p: { name: string }) => p.name.trim());
+      }
+      throw new Error('Unexpected JSON shape');
+    } catch {
+      logger.warn('Could not parse discoverProducts response');
+      return [];
+    }
   }
 
   private parseValidationResponse(raw: string): { valid: boolean; reason?: string; brand?: string; model?: string } {

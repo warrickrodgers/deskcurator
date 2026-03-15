@@ -123,6 +123,11 @@ export function checkAffiliateLinks(markdown: string): boolean {
   return /amazon\.com\/.*tag=/.test(markdown);
 }
 
+/** Buyer's guide articles must cover at least 3 distinct products. */
+export function checkProductCount(productCount: number, min = 3): boolean {
+  return productCount >= min;
+}
+
 // ── Composite scorer ───────────────────────────────────────────────────────
 
 export interface ScoreResult {
@@ -140,18 +145,20 @@ export interface ScoreResult {
  * Deductions:
  *   Title outside 50–60 chars         → -5
  *   Meta description wrong/missing    → -10
- *   Fewer than 3 H2 sections          → -10
- *   Primary keyword not in first 150w → -10
- *   Word count < 1500                 → -15
+ *   Fewer than 3 H2 sections          → -15  (auto-fail)
+ *   Primary keyword not in first 150w → -15  (auto-fail)
+ *   Word count < 1500                 → -15  (auto-fail)
+ *   Product count < 3                 → -15  (auto-fail)
+ *   No affiliate links                → -10  (auto-fail)
  *   Heading hierarchy skips           → -5
  *   Each banned phrase (max 3)        → -5 each
- *   No affiliate links                → -5
  */
 export function scoreArticle(
   markdown: string,
   title: string,
   metaDescription: string,
-  primaryKeyword: string
+  primaryKeyword: string,
+  productCount: number = 0
 ): ScoreResult {
   const passed: string[] = [];
   const warnings: string[] = [];
@@ -178,32 +185,41 @@ export function scoreArticle(
     failures.push(`Meta description: ${metaDescription.length} chars — must be 150–160`);
   }
 
-  // H2 sections
+  // H2 sections (auto-fail)
   const h2Count = extractHeadings(markdown).filter((h) => h.level === 2).length;
   const hasH2 = h2Count >= 3;
   if (hasH2) {
     passed.push(`H2 sections: ${h2Count} found (minimum 3)`);
   } else {
-    score -= 10;
+    score -= 15;
     failures.push(`H2 sections: ${h2Count} found — minimum 3 required`);
   }
 
-  // Keyword in intro
+  // Keyword in intro (auto-fail)
   const keywordInIntro = checkKeywordInIntro(markdown, primaryKeyword);
   if (keywordInIntro) {
     passed.push(`Primary keyword "${primaryKeyword}" present in first 150 words`);
   } else {
-    score -= 10;
-    warnings.push(`Primary keyword "${primaryKeyword}" not found in first 150 words`);
+    score -= 15;
+    failures.push(`Primary keyword "${primaryKeyword}" not found in first 150 words`);
   }
 
-  // Word count
+  // Word count (auto-fail)
   const wcOk = checkWordCount(markdown);
   if (wcOk) {
     passed.push(`Word count: ${wordCount} (minimum 1500)`);
   } else {
     score -= 15;
     failures.push(`Word count: ${wordCount} — minimum 1500 for affiliate articles`);
+  }
+
+  // Product count (auto-fail)
+  const pcOk = checkProductCount(productCount);
+  if (pcOk) {
+    passed.push(`Product count: ${productCount} products covered (minimum 3)`);
+  } else {
+    score -= 15;
+    failures.push(`Product count: ${productCount} — minimum 3 products required`);
   }
 
   // Heading hierarchy
@@ -225,13 +241,13 @@ export function scoreArticle(
     warnings.push(`Banned phrases found (${banned.length}): ${banned.join(', ')}`);
   }
 
-  // Affiliate links
+  // Affiliate links (auto-fail)
   const hasLinks = checkAffiliateLinks(markdown);
   if (hasLinks) {
     passed.push('Amazon affiliate links present');
   } else {
-    score -= 5;
-    warnings.push('No Amazon affiliate links detected — ensure products are linked');
+    score -= 10;
+    failures.push('No Amazon affiliate links — all reviewed products must have an affiliate link');
   }
 
   const checks: SeoChecks = {
@@ -240,6 +256,7 @@ export function scoreArticle(
     hasH2Sections: hasH2,
     keywordInIntro,
     sufficientWordCount: wcOk,
+    sufficientProductCount: pcOk,
     headingHierarchyOk: hierarchyOk,
     noBannedPhrases: banned.length === 0,
     affiliateLinksPresent: hasLinks,

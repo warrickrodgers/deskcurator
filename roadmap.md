@@ -1,8 +1,8 @@
 # DeskCurator Development Roadmap
 
-**Current Phase:** Phase 3 - Content Writer Agent COMPLETE
-**Next Phase:** Phase 4 - SEO Optimizer Agent
-**Last Updated:** March 12, 2026
+**Current Phase:** Phase 4 - SEO Optimizer Agent COMPLETE
+**Next Phase:** Phase 5 - Product Analyzer Agent
+**Last Updated:** March 14, 2026
 
 ---
 
@@ -101,80 +101,55 @@
 
 **Objective:** Generate multi-product affiliate content with queue-based parallel research
 
-> **Architecture:** Hybrid approach — synchronous initial discovery + asynchronous parallel research queue
-
-### 3.1 Database Schema Extensions (`src/services/database.service.ts`)
+### 3.1 Database Schema Extensions
 - [x] `queue_research_jobs` table (id, type, status, query, findings, parentJobId, priority, scheduledAfter, etc.)
 - [x] `article_jobs` table (id, title, type, status, researchJobIds, draftContent, scheduledAfter, etc.)
 - [x] Job status enums (pending, in_progress, awaiting_approval, approved, rejected, completed, failed)
-- [x] Database methods: createResearchJob, updateResearchJob, getResearchJobs, createArticleJob, etc.
 - [x] Additive migration system for schema updates (safe on existing databases)
 - [x] `scheduled_after` column on both job tables for RPD pause/resume
 
 ### 3.2 Job Queue Service (`src/services/jobQueue.service.ts`)
 - [x] Job creation and priority management
 - [x] Job status tracking and updates
-- [x] Polling mechanism with `scheduled_after` filtering (skips jobs paused for rate limits)
+- [x] Polling mechanism with `scheduled_after` filtering
 - [x] Job relationship tracking (parent/child jobs)
 - [x] Job retry logic with configurable max retries
 
 ### 3.3 ContentResearcher Agent — Queue Support
 - [x] Polling loop checks `queue_research_jobs` every 5s
-- [x] Processes jobs from database queue, not only direct calls
-- [x] Updates job status throughout workflow (pending → in_progress → approved/rejected)
+- [x] Updates job status throughout workflow
 - [x] Links completed research to parent article jobs
 - [x] Increments article's completed research count on approval
-- [x] Synchronous research capability preserved for Writer's initial discovery phase
 
 ### 3.4 ContentResearcher Agent — Quality Gates
-- [x] **Product validation pre-flight** — Gemini validates every topic is a real purchasable product (brand + model) before running expensive searches; `skipValidation: true` option for discovery queries
+- [x] **Product validation pre-flight** — Gemini validates every topic is a real purchasable product (brand + model) before running expensive searches
 - [x] **75% confidence threshold** — research scoring below threshold is auto-rejected and never sent for Discord approval
 - [x] Confidence scoring based on: high-credibility source count, pros/cons richness, source count, Tavily relevance scores
 
 ### 3.5 ContentWriter Agent (`src/agents/content-writer/ContentWriter.ts`)
-
-#### Phase 1: Synchronous Initial Discovery
 - [x] `createArticle(request)` method — hybrid workflow entry point
-- [x] Creates Discord thread in #writer-editor
-- [x] Calls ContentResearcher synchronously with `skipValidation: true` for topic-level discovery
-- [x] Context-aware discovery query (`buildDiscoveryQuery`) — product-focused, no accessories
-- [x] Extracts 3–5 specific named products (brand + model) from discovery findings via AI
-
-#### Phase 2: Queue Parallel Research
+- [x] Creates Discord thread in `#writer-editor`
+- [x] Extracts 3–5 specific named products via AI (categoryDiscovery / categoryExtraction)
 - [x] Creates ArticleJob in database (status: pending_research)
 - [x] Creates 3–5 ResearchJobs for each discovered product (status: pending, priority: 7)
-- [x] Links research jobs to article job (parentJobId)
-- [x] Notifies Discord thread: "Queued N research jobs"
-
-#### Phase 3: Polling & Article Generation
 - [x] `pollForCompletedResearch()` — continuous polling loop (every 10 seconds)
-- [x] Respects `scheduled_after` on article_jobs (skips articles paused for rate limits)
-- [x] Detects when all research jobs for an article are approved
 - [x] Generates buyer's guide article using structured research data via Gemini Flash
 - [x] Requests Discord approval for draft in article thread
 - [x] Publishes on final approval (writes `output/articles/<id>.md`)
 
-### 3.6 Prompt Templates (`src/agents/content-writer/context/`)
-- [x] WRITER_SYSTEM_PROMPT — buyer's guide tone and style rules
-- [x] `categoryDiscoveryPrompt` — requests 3–N brand+model named products for an article title
-- [x] `categoryExtractionPrompt` — extracts 3–N named products from existing research summary
-- [x] `articleGenerationPrompt` — structured buyer's guide: intro, comparison table, product sections, buying considerations, verdict, FAQ; per-type formatting rules for multi_product / single_product / comparison / roundup
-- [x] `seoMetaPrompt` — 150–160 char SEO meta description
-
-### 3.7 Article Types Support
+### 3.6 Article Types Support
 - [x] Single-product deep-dive: sections for Overview, Specs, Strengths, Weaknesses, Who It Suits, Verdict
 - [x] Multi-product buyer's guide: per-product H3 with positioning, specs, pros/cons, "Best for"
 - [x] Comparison article: At a Glance, Build, Stability, Value, Verdict + comparison table
 - [x] Roundup: quick-reference per-product H3 + "Quick Picks" by use case
 
-### 3.8 Intelligent Error Handling & Rate Limiting
+### 3.7 Intelligent Error Handling & Rate Limiting
 - [x] **503 Service Unavailable** — 30-min pause, then retry (up to maxRetries)
 - [x] **429 TPM** — exponential backoff per attempt
 - [x] **429 RPD** — throw immediately (no retry wasted); job/article sets `scheduled_after` to midnight
-- [x] RPD classification via response keywords ("per_day", "DAILY") or retryDelay > 1 hour
 - [x] Dual AI instances: `aiService` (Gemini Flash Lite, researcher) + `writerAiService` (Gemini Flash, writer)
 
-### 3.9 Discord Commands
+### 3.8 Discord Commands
 - [x] `!write "<title>"` — create multi-product article with hybrid workflow
 - [x] `!status` — show pending article and research jobs
 - [x] `!cancel <jobId>` — cancel article or research job
@@ -182,7 +157,7 @@
 
 **Deliverables:**
 - Queue-based job system operational
-- Writer creates multi-product buyer's guide articles via hybrid sync/async workflow
+- Writer creates multi-product buyer's guide articles
 - Pre-flight product validation prevents researching non-products
 - 75% confidence threshold gates low-quality research
 - Intelligent rate limit handling (TPM backoff, RPD midnight reschedule, 503 30-min pause)
@@ -190,83 +165,127 @@
 
 ---
 
-## Architecture Pattern: Hybrid Sync/Async
+## Phase 4: SEO Optimizer Agent COMPLETE
 
-```
-User: !write "Best Standing Desks for Tall People"
-  ↓
-Writer (SYNC): Research discovery query (skipValidation: true)
-  ↓ (waits for approval)
-Researcher: Returns [Uplift V2 Commercial, FlexiSpot E7 Pro, Jarvis Bamboo, Autonomous SmartDesk Pro]
-  ↓
-Writer (ASYNC): Creates 4 parallel ResearchJobs in database
-  ↓
-Researcher (polling): Validates, searches, scores, and processes each job
-  ↓
-Writer (polling): Waits for all 4 approved
-  ↓
-Writer (SYNC): Generates buyer's guide article via Gemini Flash
-  ↓
-Discord: Final approval
-  ↓
-Publish! output/articles/<id>.md
-```
+**Objective:** Maximise organic reach by applying deterministic SEO rules and AI-validated keyword strategy to every article, with an automated revision loop to fix issues before publication
 
-**Why Hybrid?**
-- Fast initial discovery (sync = no polling delay)
-- Efficient parallel research (async = multiple products at once)
-- Resumable (jobs persist in database, survive restarts)
-- Trackable (clear status per job)
-- Rate-limit resilient (RPD pauses until midnight, TPM backs off, 503 waits 30 min)
+> **Pipeline position:** SEO Optimizer runs automatically after human draft approval. The writer produces the draft, human approves it, the optimizer scores and transforms it, and the writer publishes the optimized version — or revises and re-runs if the score falls short.
+
+### 4.1 Product Discovery Overhaul (`src/agents/content-researcher/ContentResearcher.ts`)
+- [x] **`discoverProducts(topic)`** — new Phase 1 method: AI names ~8 real products for a topic, validates each with `validateProductPrompt`, returns the clean list
+- [x] Replaces the Tavily-based synchronous discovery call — Phase 1 is now AI-only (no search credits consumed for discovery)
+- [x] `discoverProductsPrompt` — structured JSON prompt for product enumeration with brand + model
+- [x] Parallel validation of discovered candidates (fail-open — validation errors don't drop good products)
+- [x] ContentWriter slices the validated list to `productCount` before queuing (defaults to 5)
+
+### 4.2 SEO Optimizer Agent (`src/agents/seo-optimizer/SeoOptimizer.ts`)
+- [x] `run(articleId, productCount)` — full pipeline: load → AI validation → improve markdown → score → decide → persist → notify
+- [x] Integrated into `ContentWriter.writeArticle()` — called after human approval, before publish
+- [x] Writes `output/articles/<id>_seo.json` alongside the article markdown
+
+### 4.3 Deterministic Rules Engine (`src/agents/seo-optimizer/seoScoring.ts`)
+- [x] Pure functions, no AI required — always consistent
+- [x] **Auto-fail conditions** (return `revise` regardless of score):
+  - Word count < 1500
+  - Product count < 3
+  - Primary keyword missing from first 150 words
+  - No Amazon affiliate links
+  - Fewer than 3 H2 sections
+- [x] **Scored checks** (deductions from 100):
+  - Title outside 50–60 chars → -5
+  - Meta description wrong length → -10
+  - Heading hierarchy skipped levels → -5
+  - Each banned phrase (max 3) → -5 each
+- [x] `checkProductCount`, `checkWordCount`, `checkKeywordInIntro`, `checkAffiliateLinks`, `checkH2Sections`, `checkHeadingHierarchy`, `checkTitleLength`, `checkMetaDescription`, `findBannedPhrases`
+
+### 4.4 Decision Tiers
+- [x] **PASS (≥ 75):** `status = seo_completed` → article proceeds to publish
+- [x] **REVISION (65–74, or any auto-fail):** `status = seo_revising` → writer regenerates with targeted improvement brief
+- [x] **FAIL (< 65, no auto-fail):** `status = failed` → article flagged for manual intervention
+
+### 4.5 Revision Loop (`src/agents/content-writer/ContentWriter.ts`)
+- [x] `maxRevisionAttempts = 2` — caps the loop to prevent agents fighting indefinitely
+- [x] On `revise`: ContentWriter calls `articleRevisionPrompt` with the improvement suggestions, regenerates the full draft + meta, saves to DB, re-runs SEO
+- [x] After 2 failed revisions: `status = manual_review`, Discord notification with final suggestions
+- [x] On `fail`: `status = failed`, Discord notification with all issues listed
+
+### 4.6 AI-Powered SEO Validation (Gemini)
+- [x] `seoValidationPrompt` — extracts: primary keyword, secondary keywords, search intent, suggested title, slug, readability grade, thin sections, competitor gaps
+- [x] Fallback validation if AI call fails (derives keyword from article title)
+
+### 4.7 Light Markdown Improvements
+- [x] Insert missing H1 (uses AI-suggested title or article title as fallback)
+- [x] Replace H1 with AI-suggested title if it matches the raw article title
+- [x] `fixHeadingHierarchy()` — collapses skipped heading levels (e.g. H1 → H3 becomes H1 → H2)
+
+### 4.8 SEO Audit Report
+- [x] Structured `SeoAuditReport`: `{ passed[], warnings[], failures[], keywords, wordCount, readabilityGrade, searchIntent, thinSections, competitorGaps, seoScore }`
+- [x] Stored as JSON in `article_jobs.seo_report`
+- [x] `SeoMetadata` written to `output/articles/<id>_seo.json`: title, slug, meta description, target keywords, SEO score
+- [x] `!seo-report <articleId>` Discord command prints the full audit for any article
+
+### 4.9 Discord Integration
+- [x] Dedicated `#seo-optimizer` channel (`DISCORD_SEO_OPTIMIZER_CHANNEL_ID`)
+- [x] SEO audit posted automatically after each run: decision tier, score, keyword, passed/warnings/failures, required improvements
+- [x] Score emoji: 🟢 ≥ 75 / 🟡 ≥ 65 / 🔴 < 65
+- [x] Decision emoji: ✅ PASS / 🔄 REVISION NEEDED / ❌ FAIL
+
+### 4.10 Database Schema Updates
+- [x] `seo_report TEXT` column on `article_jobs`
+- [x] `revision_count INTEGER DEFAULT 0` column on `article_jobs`
+- [x] New statuses: `seo_optimizing`, `seo_completed`, `seo_revising`, `manual_review`
+- [x] Table-recreation migration (handles CHECK constraint update on existing databases)
+
+**Deliverables:**
+- SEO Optimizer agent fully operational in the article pipeline
+- Deterministic scoring engine with 9 checks
+- Auto-fail conditions trigger revision loop (not hard failure)
+- Up to 2 AI-driven revision attempts before manual_review escalation
+- Article-type-aware product discovery (AI-only, no Tavily search credits for Phase 1)
+- Full audit trail persisted to DB and JSON file
+- `#seo-optimizer` Discord channel receives structured audit after every article
 
 ---
 
-## Phase 4: SEO Optimizer Agent PLANNED
+## Current Article Pipeline
 
-**Objective:** Maximise organic reach by applying deterministic SEO rules and AI-validated keyword strategy to every article before publication
+```
+User: !write "Best Monitor Light Bars"
+  ↓
+[Phase 1 — AI Discovery]
+ContentResearcher.discoverProducts("Best Monitor Light Bars")
+  → AI names 8 candidates
+  → Validates each (brand + model check)
+  → Returns validated list
 
-> **Pipeline position:** SEO Optimizer runs between ContentWriter's draft and the final Discord approval — the writer produces the draft, the optimizer transforms it, and the admin reviews the SEO-enhanced version.
+[Phase 2 — Parallel Research Queue]
+ContentWriter queues 5 research jobs (top 5 from validated list)
+  ↓ (async, ContentResearcher polling loop)
+Each job: Tavily search → Gemini analysis → confidence check → Discord approval
+  ↓
+All approved
 
-### 4.1 SEOOptimizer Agent (`src/agents/seo-optimizer/SEOOptimizer.ts`)
-- [ ] Receives article draft + title + article type from ContentWriter
-- [ ] Returns an optimised draft and an SEO audit report
-- [ ] Integrated into `writeArticle()` — called after generation, before Discord approval
+[Phase 3 — Article Generation]
+ContentWriter: Gemini Flash → buyer's guide markdown + meta description
+Discord: Admin approval (Approve / Reject)
+  ↓ Approved
 
-### 4.2 Deterministic Rules Engine
-Rules applied programmatically (no AI required, always consistent):
-- [ ] **Title tag validation** — H1 present, contains primary keyword, 50–60 chars
-- [ ] **Heading hierarchy** — no skipped levels (H1 → H2 → H3 only), no duplicate H1
-- [ ] **Meta description length** — enforce 150–160 characters (trim or flag if outside range)
-- [ ] **Keyword density** — primary keyword appears in H1, first paragraph, at least one H2, and conclusion; flag if over-stuffed (> 3% density)
-- [ ] **Internal link placeholders** — insert `<!-- internal-link: [topic] -->` markers at natural cross-link points
-- [ ] **Affiliate link audit** — verify every product mentioned has an affiliate link; insert missing ones using `AMAZON_AFFILIATE_TAG`
-- [ ] **Word count gate** — flag articles below 1200 words or above 2500 words
-- [ ] **Banned phrase sweep** — scan for and report any phrases that slipped past the writer prompt (e.g. "game-changer", "industry-leading")
-- [ ] **Image alt-text placeholders** — insert `<!-- img: [product name] -->` markers after each product section for future media insertion
-- [ ] **FAQ schema marker** — wrap FAQ section in `<!-- schema: FAQPage -->` comment for CMS structured data injection
+[Phase 4 — SEO Optimization + Revision Loop]
+SeoOptimizer.run(articleId, productCount)
+  → AI keyword validation (Gemini Flash)
+  → Deterministic scoring (9 checks)
+  → Decision: PASS / REVISION / FAIL
+    ↓ PASS (≥75)
+    Publish output/articles/<id>.md  ✅
 
-### 4.3 AI-Powered SEO Validation (Gemini)
-- [ ] **Primary keyword extraction** — identify the single best target keyword from the article title and content
-- [ ] **Secondary keyword suggestions** — 3–5 semantically related terms to weave into subheadings or body copy
-- [ ] **Search intent alignment** — validate the article matches the likely intent (informational / commercial / transactional) for the target keyword
-- [ ] **Readability score** — AI-estimated Flesch-Kincaid grade level; flag if above grade 10
-- [ ] **Thin content detection** — flag sections with fewer than 80 words as potential thin content
-- [ ] **Competitor gap hints** — suggest 1–2 angles or questions the article could address that competing pages typically cover
+    ↓ REVISION (65–74 or auto-fail)
+    ContentWriter regenerates draft with improvement brief
+    SEO re-runs (up to 2 attempts)
+    Still failing → manual_review  ⚠️
 
-### 4.4 SEO Audit Report
-- [ ] Structured report object: `{ passed: string[], warnings: string[], failures: string[], keywords: { primary, secondary[] }, wordCount, readabilityGrade }`
-- [ ] Stored alongside the draft in `article_jobs` (new `seo_report` JSON column)
-- [ ] Surfaced in the Discord approval embed as a collapsible summary (passed / warnings / failures counts)
-- [ ] Hard failures (missing H1, no affiliate links, word count below 1200) block approval and return the draft to `writing` status
-
-### 4.5 Prompt Templates (`src/agents/seo-optimizer/context/`)
-- [ ] `seoValidationPrompt` — keyword extraction, intent alignment, secondary keyword suggestions
-- [ ] `readabilityPrompt` — grade level estimation and thin content detection
-- [ ] `competitorGapPrompt` — surface angles competing articles cover that this one misses
-
-### 4.6 Discord Integration
-- [ ] SEO audit summary appended to article approval embed (emoji-coded: ✅ passed / ⚠️ warnings / ❌ failures)
-- [ ] `!seo-report <articleId>` command — print the full SEO audit for any article
+    ↓ FAIL (<65, no auto-fail)
+    status = failed  ❌
+```
 
 ---
 
@@ -314,7 +333,7 @@ Rules applied programmatically (no AI required, always consistent):
 
 ## Progress Tracking
 
-### Overall Completion: ~65% (Phases 0-3 complete)
+### Overall Completion: ~80% (Phases 0-4 complete)
 
 | Phase | Status | Completion | Notes |
 |-------|--------|------------|-------|
@@ -322,33 +341,19 @@ Rules applied programmatically (no AI required, always consistent):
 | Phase 1: AI Integration | Complete | 100% | Gemini + Anthropic, rate limiting, retries, token tracking |
 | Phase 2: Product Research | Complete | 100% | Tavily search, ChromaDB, SQLite, full ContentResearcher flow |
 | Phase 3: Content Writer | Complete | 100% | Buyer's guide articles, quality gates, rate limit resilience, retry command |
-| Phase 4: SEO Optimizer | Planned | 0% | Next up — slots into article pipeline before Discord approval |
+| Phase 4: SEO Optimizer | Complete | 100% | Deterministic scoring, AI validation, revision loop (max 2), manual_review escalation |
 | Phase 5: Product Analyzer | Planned | 5% | Skeleton exists in ProductAnalyzer.ts |
 | Phase 6: Advanced Features | Future | 0% | — |
-
----
-
-## Current Priorities
-
-**Immediate Next Steps (Phase 4):**
-1. Create `src/agents/seo-optimizer/SEOOptimizer.ts` with deterministic rules engine
-2. Create prompt templates in `src/agents/seo-optimizer/context/`
-3. Add `seo_report` column to `article_jobs` via additive migration
-4. Integrate `SEOOptimizer` into `ContentWriter.writeArticle()` — between generation and Discord approval
-5. Add `!seo-report <articleId>` Discord command in writer channel
-
-**Blockers:** None
-**Dependencies:** Phase 3 complete ✅
 
 ---
 
 ## Notes & Decisions
 
 ### Technology Choices
-- **AI Provider — Research:** Google Gemini `gemini-3.1-flash-lite-preview` (lightweight, fast JSON extraction)
-- **AI Provider — Writing:** Google Gemini `gemini-3-flash-preview` (more capable, full article generation)
+- **AI Provider — Research:** Google Gemini `gemini-2.0-flash-lite` (lightweight, fast JSON extraction)
+- **AI Provider — Writing & SEO:** Google Gemini `gemini-2.0-flash` (more capable, full article generation and SEO validation)
 - **Embeddings:** `gemini-embedding-001` (only model available on current free-tier API key)
-- **Web Search:** Tavily API (replaced planned Amazon scraper)
+- **Web Search:** Tavily API (replaced planned Amazon scraper; not used for Phase 1 discovery)
 - **Vector DB:** ChromaDB (local, cosine similarity, 0.85 dedup threshold)
 - **Relational DB:** SQLite via `better-sqlite3` (migrate to PostgreSQL for production)
 
@@ -356,7 +361,8 @@ Rules applied programmatically (no AI required, always consistent):
 - All research must pass product validation (brand + model required)
 - All research must score ≥ 75% confidence before Discord approval request
 - Human approval required before content generation
-- No content published without final human review
+- No content published without passing SEO score (≥ 75) or human manual_review override
+- SEO revision loop capped at 2 attempts to prevent infinite agent loops
 
 ### Development Principles
 - Build incrementally and test each phase
@@ -371,7 +377,8 @@ Rules applied programmatically (no AI required, always consistent):
 - **2026-01-13:** Project initialized, Phase 0 complete, Discord bot operational
 - **2026-01-13:** Roadmap created, Phase 1 started
 - **2026-02-23:** Phases 1 & 2 complete — dual AI providers, Tavily web search, ChromaDB embeddings, SQLite storage, full ContentResearcher agent operational
-- **2026-03-12:** Phase 3 complete — ContentWriter agent, buyer's guide article generation, product validation pre-flight, 75% confidence threshold, intelligent rate limit handling (TPM/RPD/503), `!retry-write` command, dual AI model split (Flash Lite for research, Flash for writing)
+- **2026-03-12:** Phase 3 complete — ContentWriter agent, buyer's guide article generation, product validation pre-flight, 75% confidence threshold, intelligent rate limit handling (TPM/RPD/503), `!retry-write` command, dual AI model split
+- **2026-03-14:** Phase 4 complete — SEO Optimizer agent, deterministic scoring engine, AI keyword validation, auto-fail revision loop (max 2 attempts), `manual_review` escalation, `#seo-optimizer` Discord channel, AI-only product discovery replacing Tavily-based Phase 1
 
 ---
 
