@@ -1,6 +1,6 @@
 # DeskCurator
 
-An AI-powered Discord bot that researches desk-setup products and generates affiliate articles. Two autonomous agents work together: **ContentResearcher** finds and analyses products, **ContentWriter** plans and writes full affiliate articles.
+An AI-powered Discord bot that researches desk-setup products and generates SEO-optimised affiliate articles. Three autonomous agents work together: **ContentResearcher** discovers and analyses products, **ContentWriter** plans and writes full buyer's guide articles, and **SeoOptimizer** scores and refines each article before publication.
 
 ---
 
@@ -11,7 +11,7 @@ An AI-powered Discord bot that researches desk-setup products and generates affi
 | Node.js | ≥ 18 | |
 | npm | ≥ 9 | |
 | Docker | any recent | Required for ChromaDB |
-| Discord Server | — | Developer Mode enabled |
+| Discord Server | — | Developer Mode enabled, three channels required |
 
 ---
 
@@ -48,6 +48,7 @@ DISCORD_CLIENT_ID=your_client_id
 DISCORD_GUILD_ID=your_server_id
 DISCORD_RESEARCHER_CHANNEL_ID=your_content-researcher_channel_id
 DISCORD_WRITER_CHANNEL_ID=your_writer-editor_channel_id
+DISCORD_SEO_OPTIMIZER_CHANNEL_ID=your_seo-optimizer_channel_id
 DISCORD_ADMIN_USER_ID=your_user_id
 
 # AI (Gemini required, Anthropic optional)
@@ -64,9 +65,11 @@ AMAZON_AFFILIATE_TAG=your-tag-20
 
 **Getting Discord IDs:** Enable Developer Mode (User Settings → Advanced → Developer Mode), then right-click servers, channels, and users to copy their IDs.
 
+**Three channels required:** Create `#content-researcher`, `#writer-editor`, and `#seo-optimizer` in your Discord server.
+
 ### 4. Discord bot permissions
 
-Your bot needs these permissions in both channels:
+Your bot needs these permissions in all three channels:
 - Read Messages / View Channel
 - Send Messages
 - Send Messages in Threads
@@ -97,7 +100,7 @@ npm run build
 npm start
 ```
 
-Both agents start automatically. On launch the bot sends a startup message to each channel confirming it is online.
+All three agents start automatically. On launch the bot sends a startup message to each channel confirming it is online.
 
 ---
 
@@ -113,38 +116,65 @@ Both agents start automatically. On launch the bot sends a startup message to ea
 
 | Command | Description |
 |---|---|
-| `!write "<article title>"` | Create a multi-product affiliate article. Triggers the full hybrid workflow (see below). |
+| `!write "<article title>"` | Create a multi-product affiliate article. Triggers the full pipeline (discovery → research → write → SEO). |
 | `!status` | List all article jobs with their current status and research progress. |
 | `!cancel <jobId>` | Cancel an article job or a queued research job by ID. |
+| `!retry-write <articleId>` | Re-generate an article using existing approved research — no new searches. |
+| `!seo-report <articleId>` | Print the full SEO audit for any article. |
+
+### `#seo-optimizer` channel
+
+SEO audit reports are posted here automatically after every article run. No commands required.
 
 ---
 
 ## Article Workflow (`!write`)
 
-The ContentWriter uses a hybrid sync/async approach:
-
 ```
-!write "5 Best Desk Items For Your WFH Setup"
+!write "Best Monitor Light Bars"
   │
-  ├─ [SYNC] Creates a Discord thread in #writer-editor for this article
+  ├─ Creates a Discord thread in #writer-editor for this article
   │
-  ├─ [SYNC] Calls ContentResearcher directly for initial category discovery
-  │         → Research approval posted in #content-researcher
+  ├─ [PHASE 1] AI Product Discovery
+  │   ContentResearcher asks Gemini for ~8 real products in the category
+  │   Each candidate validated (brand + model check)
+  │   Top 5 validated products selected for research
   │
-  ├─ [ASYNC] Creates 5 QueueResearchJobs in SQLite (status: pending)
-  │          → Notifies thread: "Queued 5 research jobs"
+  ├─ [PHASE 2] Parallel Research Queue
+  │   5 QueueResearchJobs created in SQLite
+  │   ContentResearcher polls queue every 5s:
+  │     Tavily search (info + reviews + competitors)
+  │     Gemini AI analysis → pros, cons, competitor summary
+  │     Confidence ≥ 75%? → approval posted in #content-researcher
+  │   Admin approves each → completedResearchCount++
   │
-  ├─ ContentResearcher polls queue every 5s, picks up jobs one by one
-  │   Each job → Tavily search → AI analysis → approval in #content-researcher
-  │   On approve → job marked 'approved', article completedResearchCount++
+  ├─ [PHASE 3] Article Generation
+  │   All research approved → Gemini Flash writes full buyer's guide
+  │   Draft approval posted in the article thread
+  │   Admin: Approve / Reject
   │
-  └─ ContentWriter polls every 10s
-      When all jobs approved → generates full article with AI
-      → Article draft approval posted in the article thread
-      → On approve → saved to output/articles/<id>.md
+  └─ [PHASE 4] SEO Optimization + Revision Loop
+      SeoOptimizer scores the article (9 deterministic checks, 0–100)
+      Audit posted to #seo-optimizer
+
+      PASS (≥ 75) → article published to output/articles/<id>.md ✅
+      REVISION (65–74 or auto-fail rule triggered):
+        Writer regenerates with targeted improvement brief
+        SEO re-runs — up to 2 revision attempts
+        Still failing → manual_review flagged in #writer-editor ⚠️
+      FAIL (<65) → article marked failed ❌
 ```
 
-**All article notifications (queued, writing, draft approval, published) appear in the article's thread in `#writer-editor`. Research approvals appear in `#content-researcher`.**
+**Auto-fail rules** (trigger revision regardless of score):
+- Word count < 1500
+- Fewer than 3 products covered
+- Primary keyword missing from first 150 words
+- No Amazon affiliate links
+- Fewer than 3 H2 sections
+
+**All article notifications appear in the article's thread in `#writer-editor`.
+Research approvals appear in `#content-researcher`.
+SEO audit reports appear in `#seo-optimizer`.**
 
 ---
 
@@ -154,12 +184,17 @@ The ContentWriter uses a hybrid sync/async approach:
 src/
 ├── agents/
 │   ├── content-researcher/
-│   │   ├── ContentResearcher.ts    # Research pipeline + queue polling
+│   │   ├── ContentResearcher.ts    # Discovery + research pipeline + queue polling
 │   │   └── context/                # System prompt + AI prompts
 │   ├── content-writer/
-│   │   ├── ContentWriter.ts        # Hybrid article workflow + polling
-│   │   └── context/                # System prompt + article prompts
-│   └── product-analyzer/           # Placeholder (Phase 4)
+│   │   ├── ContentWriter.ts        # Article workflow + SEO revision loop
+│   │   └── context/                # System prompt + article + revision prompts
+│   ├── seo-optimizer/
+│   │   ├── SeoOptimizer.ts         # Scoring, AI validation, decision, notifications
+│   │   ├── seoScoring.ts           # Pure deterministic scoring functions
+│   │   ├── seoTypes.ts             # SeoResult, SeoAuditReport, SeoChecks, SeoDecision
+│   │   └── context/                # System prompt + SEO validation prompt
+│   └── product-analyzer/           # Placeholder (Phase 5)
 │
 ├── services/
 │   ├── ai.service.ts               # Provider abstraction, rate limiting, retries
@@ -187,7 +222,9 @@ src/
 └── index.ts                        # Application entry point
 ```
 
-**Output:** Published articles are written as Markdown files to `output/articles/<jobId>.md`.
+**Output:**
+- Published articles → `output/articles/<jobId>.md`
+- SEO metadata → `output/articles/<jobId>_seo.json`
 
 ---
 
@@ -207,4 +244,4 @@ npm run lint     # ESLint
 
 ## Architecture
 
-See [architecture.md](architecture.md) for the detailed system design, database schema, and agent workflow diagrams.
+See [architecture.md](architecture.md) for the detailed system design, database schema, agent workflow diagrams, and SEO scoring rules.

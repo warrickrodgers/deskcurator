@@ -9,6 +9,7 @@ const envSchema = z.object({
   DISCORD_GUILD_ID: z.string().min(1, 'Discord guild ID is required'),
   DISCORD_RESEARCHER_CHANNEL_ID: z.string().min(1, 'Researcher channel ID is required'),
   DISCORD_WRITER_CHANNEL_ID: z.string().min(1, 'Writer channel ID is required'),
+  DISCORD_SEO_OPTIMIZER_CHANNEL_ID: z.string().min(1, 'SEO optimizer channel ID is required'),
   DISCORD_ADMIN_USER_ID: z.string().min(1, 'Admin user ID is required'),
   ANTHROPIC_API_KEY: z.string().optional(),
   GEMINI_API_KEY: z.string().min(1, 'Gemini API key is required'),
@@ -44,6 +45,7 @@ export const config = {
     guildId: env.DISCORD_GUILD_ID,
     researcherChannelId: env.DISCORD_RESEARCHER_CHANNEL_ID,
     writerChannelId: env.DISCORD_WRITER_CHANNEL_ID,
+    seoChannelId: env.DISCORD_SEO_OPTIMIZER_CHANNEL_ID,
     adminUserId: env.DISCORD_ADMIN_USER_ID,
   },
   ai: {

@@ -23,6 +23,7 @@ type WriteCommandHandler = (title: string) => Promise<void>;
 type StatusCommandHandler = () => Promise<void>;
 type CancelCommandHandler = (jobId: string) => Promise<void>;
 type RetryWriteCommandHandler = (articleId: string) => Promise<void>;
+type SeoReportCommandHandler = (articleId: string) => Promise<void>;
 
 type SendableChannel = TextChannel | NewsChannel | ThreadChannel;
 
@@ -43,6 +44,7 @@ export class DiscordService {
   private statusHandler: StatusCommandHandler | null = null;
   private cancelHandler: CancelCommandHandler | null = null;
   private retryWriteHandler: RetryWriteCommandHandler | null = null;
+  private seoReportHandler: SeoReportCommandHandler | null = null;
 
   constructor() {
     this.client = new Client({
@@ -158,6 +160,23 @@ export class DiscordService {
           this.retryWriteHandler(articleId).catch(async (err) => {
             logger.error('Retry-write command failed:', err);
             await message.reply(`Retry failed: ${err.message}`).catch(() => {});
+          });
+          return;
+        }
+
+        if (content.startsWith('!seo-report ')) {
+          const articleId = content.slice('!seo-report '.length).trim();
+          if (!articleId) {
+            await message.reply('Usage: `!seo-report <articleId>`');
+            return;
+          }
+          if (!this.seoReportHandler) {
+            await message.reply('SEO agent not initialized yet.');
+            return;
+          }
+          this.seoReportHandler(articleId).catch(async (err) => {
+            logger.error('SEO report command failed:', err);
+            await message.reply(`SEO report failed: ${err.message}`).catch(() => {});
           });
           return;
         }
@@ -414,6 +433,11 @@ export class DiscordService {
   registerRetryWriteHandler(handler: RetryWriteCommandHandler): void {
     this.retryWriteHandler = handler;
     logger.info('Retry-write command handler registered (!retry-write <articleId>)');
+  }
+
+  registerSeoReportHandler(handler: SeoReportCommandHandler): void {
+    this.seoReportHandler = handler;
+    logger.info('SEO report command handler registered (!seo-report <articleId>)');
   }
 
   getClient(): Client {

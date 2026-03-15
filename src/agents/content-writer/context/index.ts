@@ -3,5 +3,6 @@ export {
   categoryDiscoveryPrompt,
   categoryExtractionPrompt,
   articleGenerationPrompt,
+  articleRevisionPrompt,
   seoMetaPrompt,
 } from './prompts';

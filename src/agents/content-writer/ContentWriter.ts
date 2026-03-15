@@ -3,20 +3,20 @@ import * as path from 'path';
 import { randomUUID } from 'crypto';
 import logger from '../../utils/logger';
 import discordService from '../../services/discord';
-import { aiService, writerAiService } from '../../services/ai.service';
+import { writerAiService } from '../../services/ai.service';
 import { databaseService } from '../../services/database.service';
 import { jobQueueService } from '../../services/jobQueue.service';
 import {
   WRITER_SYSTEM_PROMPT,
-  categoryDiscoveryPrompt,
-  categoryExtractionPrompt,
   articleGenerationPrompt,
+  articleRevisionPrompt,
   seoMetaPrompt,
 } from './context';
 import { ArticleRequest, ResearchFindings, ApprovalRequest } from '../../types';
 import { ArticleJob, QueueResearchJob } from '../../types/jobs';
 import { AIServiceError, AIErrorType, RateLimitType } from '../../types/ai.types';
 import ContentResearcher from '../content-researcher/ContentResearcher';
+import SeoOptimizer from '../seo-optimizer/SeoOptimizer';
 import config from '../../config/env';
 
 const OUTPUT_DIR = path.join(process.cwd(), 'output', 'articles');
@@ -26,7 +26,10 @@ export class ContentWriter {
   private isRunning = false;
   private pollTimer: NodeJS.Timeout | null = null;
 
-  constructor(private readonly contentResearcher: ContentResearcher) {
+  constructor(
+    private readonly contentResearcher: ContentResearcher,
+    private readonly seoOptimizer: SeoOptimizer
+  ) {
     logger.info('ContentWriter agent initialized');
   }
 
@@ -98,22 +101,20 @@ export class ContentWriter {
       discordService.sendNotification(msg, threadId ?? config.discord.writerChannelId);
 
     try {
-      // ── PHASE 1: Synchronous initial discovery ───────────────────────────
-      logger.info('Phase 1: initial category discovery (synchronous)…');
-      await notify(`🔍 **Phase 1:** Running initial category discovery for **"${request.title}"**…`);
+      // ── PHASE 1: AI product discovery + validation ────────────────────────
+      logger.info('Phase 1: AI product discovery…');
+      await notify(`🔍 **Phase 1:** Discovering products for **"${request.title}"**…`);
 
-      const discoveryQuery = this.buildDiscoveryQuery(request.title, request.articleType);
-      // skipValidation: discovery is a topic search, not a specific product name
-      const initialFindings = await this.contentResearcher.researchProduct(discoveryQuery, { skipValidation: true });
+      const discovered = await this.contentResearcher.discoverProducts(request.title);
 
-      if (!initialFindings) {
-        await notify(`❌ Aborted — initial research was rejected or skipped.`);
+      if (discovered.length === 0) {
+        await notify(`❌ Aborted — no products could be discovered for this topic.`);
         return;
       }
 
-      // Extract categories from initial research
-      const categories = await this.extractCategories(initialFindings, productCount);
-      logger.info(`Identified ${categories.length} categories: ${categories.join(', ')}`);
+      // Take up to productCount of the validated discoveries
+      const categories = discovered.slice(0, productCount);
+      logger.info(`Discovered ${discovered.length} products, selecting ${categories.length}: ${categories.join(', ')}`);
 
       // ── PHASE 2: Queue parallel research jobs ────────────────────────────
       logger.info('Phase 2: queuing parallel product research jobs…');
@@ -282,8 +283,90 @@ export class ContentWriter {
       );
 
       if (approved) {
-        logger.info(`Article ${article.id} approved — publishing`);
-        await this.publishArticle(article, fullDraft);
+        databaseService.updateArticleJob(article.id, { status: 'approved' });
+        logger.info(`Article ${article.id} approved — running SEO optimization`);
+        await this.notifyArticle(article, `🔍 **SEO optimization in progress…**`);
+
+        const MAX_REVISIONS = 2;
+        let currentDraft = fullDraft;
+        let publishContent: string | null = null;
+
+        for (let attempt = 0; attempt <= MAX_REVISIONS; attempt++) {
+          const seoResult = await this.seoOptimizer.run(article.id, researchItems.length);
+
+          if (seoResult.decision === 'approved') {
+            publishContent = seoResult.optimizedMarkdown;
+            break;
+          }
+
+          if (seoResult.decision === 'fail') {
+            databaseService.updateArticleJob(article.id, { status: 'failed' });
+            await this.notifyArticle(
+              article,
+              `❌ **SEO audit failed** — article does not meet minimum quality standards.\n` +
+              seoResult.improvementSuggestions.map((s) => `  • ${s}`).join('\n')
+            );
+            return;
+          }
+
+          // decision === 'revise'
+          if (attempt >= MAX_REVISIONS) {
+            databaseService.updateArticleJob(article.id, { status: 'manual_review' });
+            await this.notifyArticle(
+              article,
+              `⚠️ **Manual review required** — article failed SEO after ${MAX_REVISIONS} revision attempts.\n` +
+              `ID: \`${article.id}\`\n` +
+              seoResult.improvementSuggestions.map((s) => `  • ${s}`).join('\n')
+            );
+            return;
+          }
+
+          // Regenerate with SEO feedback
+          const revisionNumber = attempt + 1;
+          databaseService.updateArticleJob(article.id, {
+            status: 'seo_revising',
+            revisionCount: revisionNumber,
+          });
+          await this.notifyArticle(
+            article,
+            `🔄 **Revision ${revisionNumber}/${MAX_REVISIONS}** — rewriting to address SEO feedback…`
+          );
+          logger.info(`Article ${article.id}: revision ${revisionNumber}/${MAX_REVISIONS}`);
+
+          const revisedDraft = await writerAiService.ask(
+            articleRevisionPrompt(
+              article.title,
+              article.articleType,
+              researchItems,
+              currentDraft,
+              seoResult.improvementSuggestions,
+              config.amazon.affiliateTag
+            ),
+            WRITER_SYSTEM_PROMPT
+          );
+
+          const revisedMeta = await writerAiService.ask(
+            seoMetaPrompt(article.title, revisedDraft),
+            WRITER_SYSTEM_PROMPT
+          );
+
+          currentDraft = `${revisedDraft}\n\n---\n*Meta description: ${revisedMeta.trim()}*`;
+
+          // Save revised draft and re-approve for SEO to pick up
+          databaseService.updateArticleJob(article.id, {
+            draftContent: currentDraft,
+            status: 'approved',
+          });
+        }
+
+        if (publishContent === null) {
+          // Exhausted loop without resolving — shouldn't happen, but guard anyway
+          databaseService.updateArticleJob(article.id, { status: 'manual_review' });
+          await this.notifyArticle(article, `⚠️ **Manual review required** — SEO loop exhausted.\nID: \`${article.id}\``);
+          return;
+        }
+
+        await this.publishArticle(article, publishContent);
       } else {
         databaseService.updateArticleJob(article.id, { status: 'rejected' });
         logger.info(`Article ${article.id} rejected${feedback ? ` — feedback: ${feedback}` : ''}`);
@@ -353,24 +436,6 @@ export class ContentWriter {
    * Send a notification into the article's thread, or the writer channel as fallback.
    */
   /**
-   * Build the initial discovery query for Phase 1 research.
-   *
-   * For focused single-topic articles (e.g. "Best ergonomic chair for programmers"),
-   * the title is already a good search query — use it directly so the researcher
-   * finds relevant chairs rather than "product categories someone would need".
-   *
-   * For broad multi-category articles (e.g. "Best home office setup"), prepend
-   * context so the researcher returns a range of product types.
-   */
-  private buildDiscoveryQuery(title: string, articleType: string): string {
-    const broadTypes = ['multi_product', 'roundup'];
-    if (broadTypes.includes(articleType)) {
-      return `Best products for: ${title} — include only specific purchasable products with brand and model names, no accessories`;
-    }
-    return `Best products for: ${title} — specific purchasable products only, no accessories or features`;
-  }
-
-  /**
    * Build the per-product research query from a discovered topic/category.
    *
    * If the topic looks like a specific product name (starts with a capital letter
@@ -389,41 +454,6 @@ export class ContentWriter {
     return discordService.sendNotification(message, targetId);
   }
 
-  private async extractCategories(
-    findings: ResearchFindings,
-    count: number
-  ): Promise<string[]> {
-    try {
-      const raw = await aiService.ask(
-        categoryExtractionPrompt(findings.summary, count),
-        WRITER_SYSTEM_PROMPT
-      );
-      const cleaned = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-      const parsed = JSON.parse(cleaned);
-      if (Array.isArray(parsed) && parsed.every((c) => typeof c === 'string')) {
-        return parsed.slice(0, count);
-      }
-      throw new Error('Unexpected JSON shape');
-    } catch {
-      logger.warn('Category extraction from summary failed — using discovery prompt');
-    }
-
-    try {
-      const raw = await aiService.ask(
-        categoryDiscoveryPrompt(findings.product.name, count),
-        WRITER_SYSTEM_PROMPT
-      );
-      const cleaned = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-      const parsed = JSON.parse(cleaned);
-      if (Array.isArray(parsed) && parsed.every((c) => typeof c === 'string')) {
-        return parsed.slice(0, count);
-      }
-    } catch {
-      logger.warn('Category discovery fallback also failed — using pros as category hints');
-    }
-
-    return findings.pros.slice(0, count).map((p) => p.split(' ').slice(0, 3).join(' '));
-  }
 }
 
 export default ContentWriter;

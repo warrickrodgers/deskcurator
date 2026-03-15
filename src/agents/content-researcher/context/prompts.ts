@@ -3,6 +3,40 @@
  * All JSON-returning prompts strip markdown fences in the caller before parsing.
  */
 
+export function discoverProductsPrompt(topic: string, count: number = 8): string {
+  return `You are identifying real purchasable products for a buying guide article.
+
+Topic:
+"${topic}"
+
+Task:
+Identify ${count} real products that belong in this category.
+
+Rules:
+- Only include real products currently sold online
+- Each product must include both a brand and model name
+- Do NOT include generic product categories
+- Do NOT include accessories unrelated to the topic
+- Prefer well-known or commonly reviewed products
+
+Respond with ONLY this JSON object:
+
+{
+  "products": [
+    { "brand": "Brand Name", "model": "Model Name", "name": "Full Product Name" }
+  ]
+}
+
+Example format:
+
+{
+  "products": [
+    { "brand": "BenQ", "model": "ScreenBar Halo", "name": "BenQ ScreenBar Halo Monitor Light" },
+    { "brand": "Xiaomi", "model": "Mi Computer Monitor Light Bar", "name": "Xiaomi Mi Computer Monitor Light Bar" }
+  ]
+}`;
+}
+
 /**
  * Pre-flight check: determines whether a research topic is a real purchasable
  * product (has a brand + model name) or is a feature, concept, or category.
